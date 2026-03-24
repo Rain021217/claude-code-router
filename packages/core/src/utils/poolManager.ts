@@ -1,3 +1,6 @@
+import { mkdir, readFile, rename, writeFile } from "fs/promises";
+import { dirname } from "path";
+
 type CooldownReason =
   | "http_429"
   | "http_503"
@@ -23,6 +26,9 @@ interface PoolManagerConfig {
   allowedFails?: number;
   allowedFailsPolicy?: Record<string, number>;
   failureWindowMs?: number;
+  persistEnabled?: boolean;
+  persistDebounceMs?: number;
+  stateFile?: string;
 }
 
 const DEFAULT_CONFIG: Required<PoolManagerConfig> = {
@@ -37,6 +43,9 @@ const DEFAULT_CONFIG: Required<PoolManagerConfig> = {
     transport_error: 2,
   },
   failureWindowMs: 300_000,
+  persistEnabled: true,
+  persistDebounceMs: 300,
+  stateFile: "",
   statusCooldownMs: {
     "429": 300_000,
     "503": 60_000,
@@ -47,6 +56,23 @@ const DEFAULT_CONFIG: Required<PoolManagerConfig> = {
 };
 
 export type PoolManagerCooldownReason = CooldownReason;
+
+interface PoolManagerPersistedState {
+  version: number;
+  savedAt: number;
+  providerStates: ProviderCooldownState[];
+  failureCounters: Array<{
+    routeKey: string;
+    count: number;
+    updatedAt: number;
+    lastStatusCode?: number;
+    lastError?: string;
+  }>;
+  scenarioCursors: Array<{
+    scenarioType: string;
+    cursor: number;
+  }>;
+}
 
 export class PoolManager {
   private readonly providerStates = new Map<string, ProviderCooldownState>();
@@ -60,6 +86,9 @@ export class PoolManager {
       lastError?: string;
     }
   >();
+  private hasHydrated = false;
+  private persistTimer: ReturnType<typeof setTimeout> | null = null;
+  private persistInFlight: Promise<void> = Promise.resolve();
 
   private getConfig(rawConfig?: PoolManagerConfig): Required<PoolManagerConfig> {
     return {
@@ -75,11 +104,24 @@ export class PoolManager {
       },
       failureWindowMs:
         rawConfig?.failureWindowMs ?? DEFAULT_CONFIG.failureWindowMs,
+      persistEnabled:
+        rawConfig?.persistEnabled ?? DEFAULT_CONFIG.persistEnabled,
+      persistDebounceMs:
+        rawConfig?.persistDebounceMs ?? DEFAULT_CONFIG.persistDebounceMs,
+      stateFile: rawConfig?.stateFile ?? DEFAULT_CONFIG.stateFile,
       statusCooldownMs: {
         ...DEFAULT_CONFIG.statusCooldownMs,
         ...(rawConfig?.statusCooldownMs || {}),
       },
     };
+  }
+
+  private getStateFile(rawConfig?: PoolManagerConfig): string | null {
+    const config = this.getConfig(rawConfig);
+    if (!config.persistEnabled || !config.stateFile) {
+      return null;
+    }
+    return config.stateFile;
   }
 
   private cleanupExpired(rawConfig?: PoolManagerConfig, now = Date.now()) {
@@ -94,6 +136,157 @@ export class PoolManager {
         this.failureCounters.delete(providerName);
       }
     }
+  }
+
+  private exportState(rawConfig?: PoolManagerConfig): PoolManagerPersistedState {
+    this.cleanupExpired(rawConfig);
+    return {
+      version: 1,
+      savedAt: Date.now(),
+      providerStates: Array.from(this.providerStates.values()),
+      failureCounters: Array.from(this.failureCounters.entries()).map(
+        ([routeKey, counter]) => ({
+          routeKey,
+          count: counter.count,
+          updatedAt: counter.updatedAt,
+          lastStatusCode: counter.lastStatusCode,
+          lastError: counter.lastError,
+        })
+      ),
+      scenarioCursors: Array.from(this.scenarioCursors.entries()).map(
+        ([scenarioType, cursor]) => ({
+          scenarioType,
+          cursor,
+        })
+      ),
+    };
+  }
+
+  private importState(
+    state: PoolManagerPersistedState,
+    rawConfig?: PoolManagerConfig
+  ) {
+    this.providerStates.clear();
+    this.failureCounters.clear();
+    this.scenarioCursors.clear();
+
+    for (const providerState of state.providerStates || []) {
+      this.providerStates.set(providerState.routeKey, providerState);
+    }
+    for (const counter of state.failureCounters || []) {
+      this.failureCounters.set(counter.routeKey, {
+        count: counter.count,
+        updatedAt: counter.updatedAt,
+        lastStatusCode: counter.lastStatusCode,
+        lastError: counter.lastError,
+      });
+    }
+    for (const cursor of state.scenarioCursors || []) {
+      this.scenarioCursors.set(cursor.scenarioType, cursor.cursor);
+    }
+    this.cleanupExpired(rawConfig);
+  }
+
+  async hydrateOnce(rawConfig?: PoolManagerConfig, logger?: any) {
+    if (this.hasHydrated) {
+      return;
+    }
+    this.hasHydrated = true;
+    const stateFile = this.getStateFile(rawConfig);
+    if (!stateFile) {
+      return;
+    }
+    try {
+      const raw = await readFile(stateFile, "utf8");
+      const parsed = JSON.parse(raw) as PoolManagerPersistedState;
+      this.importState(parsed, rawConfig);
+      logger?.info?.(
+        {
+          stateFile,
+          coolingProviders: this.providerStates.size,
+          providersWithRecentFailures: this.failureCounters.size,
+          scenarioCursorCount: this.scenarioCursors.size,
+        },
+        "[PoolManager] hydrated persisted state"
+      );
+    } catch (error: any) {
+      if (error?.code === "ENOENT") {
+        logger?.info?.({ stateFile }, "[PoolManager] state file does not exist yet");
+        return;
+      }
+      logger?.warn?.(
+        {
+          stateFile,
+          message: error?.message,
+        },
+        "[PoolManager] failed to hydrate state file"
+      );
+    }
+  }
+
+  private queuePersist(
+    stateFile: string,
+    payload: PoolManagerPersistedState,
+    logger?: any
+  ) {
+    this.persistInFlight = this.persistInFlight
+      .then(async () => {
+        const dir = dirname(stateFile);
+        const tmpFile = `${stateFile}.tmp`;
+        await mkdir(dir, { recursive: true });
+        await writeFile(
+          tmpFile,
+          JSON.stringify(payload, null, 2) + "\n",
+          "utf8"
+        );
+        await rename(tmpFile, stateFile);
+        logger?.debug?.(
+          {
+            stateFile,
+            coolingProviders: payload.providerStates.length,
+            providersWithRecentFailures: payload.failureCounters.length,
+          },
+          "[PoolManager] persisted state to disk"
+        );
+      })
+      .catch((error: any) => {
+        logger?.warn?.(
+          {
+            stateFile,
+            message: error?.message,
+          },
+          "[PoolManager] failed to persist state"
+        );
+      });
+    return this.persistInFlight;
+  }
+
+  schedulePersist(rawConfig?: PoolManagerConfig, logger?: any) {
+    const stateFile = this.getStateFile(rawConfig);
+    if (!stateFile) {
+      return;
+    }
+    const config = this.getConfig(rawConfig);
+    if (this.persistTimer) {
+      clearTimeout(this.persistTimer);
+    }
+    this.persistTimer = setTimeout(() => {
+      this.persistTimer = null;
+      void this.flushNow(rawConfig, logger);
+    }, config.persistDebounceMs);
+  }
+
+  async flushNow(rawConfig?: PoolManagerConfig, logger?: any) {
+    const stateFile = this.getStateFile(rawConfig);
+    if (!stateFile) {
+      return;
+    }
+    if (this.persistTimer) {
+      clearTimeout(this.persistTimer);
+      this.persistTimer = null;
+    }
+    const payload = this.exportState(rawConfig);
+    await this.queuePersist(stateFile, payload, logger);
   }
 
   private parseProviderName(route?: string | null): string | null {
@@ -247,24 +440,34 @@ export class PoolManager {
       },
       "[PoolManager] provider moved to cooldown"
     );
+    this.schedulePersist(rawConfig, logger);
   }
 
-  clearCooldown(routeKey: string, logger?: any) {
+  clearCooldown(routeKey: string, rawConfig?: PoolManagerConfig, logger?: any) {
+    let changed = false;
     if (this.providerStates.delete(routeKey)) {
+      changed = true;
       logger?.info?.({ routeKey }, "[PoolManager] provider cooldown cleared");
     }
-    this.failureCounters.delete(routeKey);
+    if (this.failureCounters.delete(routeKey)) {
+      changed = true;
+    }
+    if (changed) {
+      this.schedulePersist(rawConfig, logger);
+    }
   }
 
-  clearAll(logger?: any) {
+  clearAll(rawConfig?: PoolManagerConfig, logger?: any) {
     const cooldownCount = this.providerStates.size;
     const failureCount = this.failureCounters.size;
     this.providerStates.clear();
     this.failureCounters.clear();
+    this.scenarioCursors.clear();
     logger?.info?.(
       { cooldownCount, failureCount },
       "[PoolManager] cleared all cooldown and failure state"
     );
+    this.schedulePersist(rawConfig, logger);
   }
 
   forceCooldown(params: {
@@ -327,19 +530,30 @@ export class PoolManager {
       },
       "[PoolManager] provider manually forced into cooldown"
     );
+    this.schedulePersist(rawConfig, logger);
   }
 
-  noteSuccess(routeKey: string, logger?: any) {
-    this.failureCounters.delete(routeKey);
+  noteSuccess(routeKey: string, rawConfig?: PoolManagerConfig, logger?: any) {
+    let changed = false;
+    if (this.failureCounters.delete(routeKey)) {
+      changed = true;
+    }
     const existing = this.providerStates.get(routeKey);
     if (!existing) {
+      if (changed) {
+        this.schedulePersist(rawConfig, logger);
+      }
       return;
     }
     this.providerStates.delete(routeKey);
+    changed = true;
     logger?.info?.(
       { routeKey },
       "[PoolManager] provider removed from cooldown after success"
     );
+    if (changed) {
+      this.schedulePersist(rawConfig, logger);
+    }
   }
 
   pickRoute(params: {
@@ -382,6 +596,7 @@ export class PoolManager {
           scenarioType,
           (index + 1) % uniqueCandidates.length
         );
+        this.schedulePersist(rawConfig, logger);
         logger?.info?.(
           {
             scenarioType,
@@ -408,6 +623,7 @@ export class PoolManager {
       scenarioType,
       (startIndex + 1) % uniqueCandidates.length
     );
+    this.schedulePersist(rawConfig, logger);
     return fallbackRoute;
   }
 

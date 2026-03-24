@@ -285,7 +285,7 @@ async function handleFallback(
         { req: newReq }
       );
 
-      poolManager.noteSuccess(fallbackRouteKey, req.log);
+      poolManager.noteSuccess(fallbackRouteKey, poolManagerConfig, req.log);
       req.log.info(`Fallback model ${fallbackModel} succeeded`);
 
       // Format and return response
@@ -510,7 +510,11 @@ async function sendRequestToProvider(
     );
   }
 
-  poolManager.noteSuccess(`${provider.name},${requestBody.model}`, fastify.log);
+  poolManager.noteSuccess(
+    `${provider.name},${requestBody.model}`,
+    fastify.configService.get<any>("PoolManager"),
+    fastify.log
+  );
 
   return response;
 }
@@ -724,9 +728,13 @@ export const registerApiRoutes = async (
       const effectiveRouteKey = routeKey || providerName;
 
       if (effectiveRouteKey) {
-        poolManager.clearCooldown(effectiveRouteKey, req.log);
+        poolManager.clearCooldown(
+          effectiveRouteKey,
+          poolManagerConfig,
+          req.log
+        );
       } else {
-        poolManager.clearAll(req.log);
+        poolManager.clearAll(poolManagerConfig, req.log);
       }
 
       reply.code(202);

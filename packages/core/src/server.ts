@@ -33,6 +33,7 @@ import { TransformerService } from "./services/transformer";
 import { TokenizerService } from "./services/tokenizer";
 import { router, calculateTokenCount, searchProjectBySession } from "./utils/router";
 import { sessionUsageCache } from "./utils/cache";
+import { poolManager } from "./utils/poolManager";
 
 // Extend FastifyRequest to include custom properties
 declare module "fastify" {
@@ -198,6 +199,7 @@ class Server {
   async start(): Promise<void> {
     try {
       this.app._server = this;
+      const poolManagerConfig = this.configService.get<any>("PoolManager");
 
       this.app.addHook("preHandler", (req, reply, done) => {
         const url = new URL(`http://127.0.0.1${req.url}`);
@@ -212,6 +214,7 @@ class Server {
       });
 
       await this.registerNamespace('/')
+      await poolManager.hydrateOnce(poolManagerConfig, this.app.log);
 
       this.app.addHook(
         "preHandler",
@@ -248,6 +251,7 @@ class Server {
 
       const shutdown = async (signal: string) => {
         this.app.log.info(`Received ${signal}, shutting down gracefully...`);
+        await poolManager.flushNow(poolManagerConfig, this.app.log);
         await this.app.close();
         process.exit(0);
       };
