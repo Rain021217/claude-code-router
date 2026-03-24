@@ -20,6 +20,17 @@ interface ProviderCooldownState {
   updatedAt: number;
 }
 
+interface PoolManagerStats {
+  selectedRoutes: number;
+  retryableErrors: number;
+  failFastErrors: number;
+  cooldownTransitions: number;
+  manualCooldowns: number;
+  fallbackAttempts: number;
+  fallbackSuccesses: number;
+  fallbackExhausted: number;
+}
+
 interface PoolManagerConfig {
   enabled?: boolean;
   defaultCooldownMs?: number;
@@ -76,6 +87,22 @@ interface PoolManagerPersistedState {
     scenarioType: string;
     cursor: number;
   }>;
+  stats: PoolManagerStats;
+  scenarioSelections: Array<{
+    scenarioType: string;
+    routeKey: string;
+    selectedAt: number;
+    count: number;
+  }>;
+  recentEvents: Array<{
+    type: string;
+    routeKey?: string;
+    scenarioType?: string;
+    reason?: string;
+    statusCode?: number;
+    timestamp: number;
+    details?: string;
+  }>;
 }
 
 export class PoolManager {
@@ -90,6 +117,33 @@ export class PoolManager {
       lastError?: string;
     }
   >();
+  private stats: PoolManagerStats = {
+    selectedRoutes: 0,
+    retryableErrors: 0,
+    failFastErrors: 0,
+    cooldownTransitions: 0,
+    manualCooldowns: 0,
+    fallbackAttempts: 0,
+    fallbackSuccesses: 0,
+    fallbackExhausted: 0,
+  };
+  private readonly scenarioSelections = new Map<
+    string,
+    {
+      routeKey: string;
+      selectedAt: number;
+      count: number;
+    }
+  >();
+  private recentEvents: Array<{
+    type: string;
+    routeKey?: string;
+    scenarioType?: string;
+    reason?: string;
+    statusCode?: number;
+    timestamp: number;
+    details?: string;
+  }> = [];
   private hasHydrated = false;
   private persistTimer: ReturnType<typeof setTimeout> | null = null;
   private persistInFlight: Promise<void> = Promise.resolve();
@@ -142,6 +196,23 @@ export class PoolManager {
     }
   }
 
+  private pushEvent(event: {
+    type: string;
+    routeKey?: string;
+    scenarioType?: string;
+    reason?: string;
+    statusCode?: number;
+    details?: string;
+  }) {
+    this.recentEvents.push({
+      ...event,
+      timestamp: Date.now(),
+    });
+    if (this.recentEvents.length > 50) {
+      this.recentEvents = this.recentEvents.slice(-50);
+    }
+  }
+
   private exportState(rawConfig?: PoolManagerConfig): PoolManagerPersistedState {
     this.cleanupExpired(rawConfig);
     return {
@@ -163,6 +234,16 @@ export class PoolManager {
           cursor,
         })
       ),
+      stats: { ...this.stats },
+      scenarioSelections: Array.from(this.scenarioSelections.entries()).map(
+        ([scenarioType, selection]) => ({
+          scenarioType,
+          routeKey: selection.routeKey,
+          selectedAt: selection.selectedAt,
+          count: selection.count,
+        })
+      ),
+      recentEvents: [...this.recentEvents],
     };
   }
 
@@ -173,6 +254,18 @@ export class PoolManager {
     this.providerStates.clear();
     this.failureCounters.clear();
     this.scenarioCursors.clear();
+    this.scenarioSelections.clear();
+    this.recentEvents = [];
+    this.stats = {
+      selectedRoutes: 0,
+      retryableErrors: 0,
+      failFastErrors: 0,
+      cooldownTransitions: 0,
+      manualCooldowns: 0,
+      fallbackAttempts: 0,
+      fallbackSuccesses: 0,
+      fallbackExhausted: 0,
+    };
 
     for (const providerState of state.providerStates || []) {
       this.providerStates.set(providerState.routeKey, providerState);
@@ -188,6 +281,18 @@ export class PoolManager {
     for (const cursor of state.scenarioCursors || []) {
       this.scenarioCursors.set(cursor.scenarioType, cursor.cursor);
     }
+    for (const selection of state.scenarioSelections || []) {
+      this.scenarioSelections.set(selection.scenarioType, {
+        routeKey: selection.routeKey,
+        selectedAt: selection.selectedAt,
+        count: selection.count,
+      });
+    }
+    this.stats = {
+      ...this.stats,
+      ...(state.stats || {}),
+    };
+    this.recentEvents = [...(state.recentEvents || [])].slice(-50);
     this.cleanupExpired(rawConfig);
   }
 
@@ -359,10 +464,10 @@ export class PoolManager {
       typeof statusCode === "number" && statusCode >= 500 ? "5xx" : undefined;
 
     return (
+      config.allowedFailsPolicy[reason] ||
       (typeof statusCode === "number" &&
         config.allowedFailsPolicy[String(statusCode)]) ||
       (statusKey && config.allowedFailsPolicy[statusKey]) ||
-      config.allowedFailsPolicy[reason] ||
       config.allowedFails
     );
   }
@@ -433,6 +538,17 @@ export class PoolManager {
     };
 
     this.providerStates.set(routeKey, state);
+    this.stats.cooldownTransitions += 1;
+    if (reason === "manual_skip") {
+      this.stats.manualCooldowns += 1;
+    }
+    this.pushEvent({
+      type: "cooldown",
+      routeKey,
+      reason,
+      statusCode,
+      details: message,
+    });
     logger?.warn?.(
       {
         routeKey,
@@ -467,6 +583,18 @@ export class PoolManager {
     this.providerStates.clear();
     this.failureCounters.clear();
     this.scenarioCursors.clear();
+    this.scenarioSelections.clear();
+    this.recentEvents = [];
+    this.stats = {
+      selectedRoutes: 0,
+      retryableErrors: 0,
+      failFastErrors: 0,
+      cooldownTransitions: 0,
+      manualCooldowns: 0,
+      fallbackAttempts: 0,
+      fallbackSuccesses: 0,
+      fallbackExhausted: 0,
+    };
     logger?.info?.(
       { cooldownCount, failureCount },
       "[PoolManager] cleared all cooldown and failure state"
@@ -524,6 +652,15 @@ export class PoolManager {
       consecutiveFailures: Math.max(previousFailureCount, 1),
       updatedAt: now,
     });
+    this.stats.cooldownTransitions += 1;
+    this.stats.manualCooldowns += 1;
+    this.pushEvent({
+      type: "manual_cooldown",
+      routeKey,
+      reason,
+      statusCode,
+      details: message || "forced cooldown",
+    });
 
     logger?.warn?.(
       {
@@ -558,6 +695,112 @@ export class PoolManager {
     if (changed) {
       this.schedulePersist(rawConfig, logger);
     }
+  }
+
+  noteSelectedRoute(params: {
+    scenarioType: string;
+    routeKey: string;
+    rawConfig?: PoolManagerConfig;
+    logger?: any;
+  }) {
+    const { scenarioType, routeKey, rawConfig, logger } = params;
+    const previous = this.scenarioSelections.get(scenarioType);
+    this.scenarioSelections.set(scenarioType, {
+      routeKey,
+      selectedAt: Date.now(),
+      count: previous && previous.routeKey === routeKey ? previous.count + 1 : 1,
+    });
+    this.stats.selectedRoutes += 1;
+    this.pushEvent({
+      type: "selected_route",
+      scenarioType,
+      routeKey,
+    });
+    this.schedulePersist(rawConfig, logger);
+  }
+
+  noteRetryableFailure(params: {
+    routeKey: string;
+    reason: CooldownReason;
+    statusCode?: number;
+    details?: string;
+    rawConfig?: PoolManagerConfig;
+    logger?: any;
+  }) {
+    const { routeKey, reason, statusCode, details, rawConfig, logger } = params;
+    this.stats.retryableErrors += 1;
+    this.pushEvent({
+      type: "retryable_error",
+      routeKey,
+      reason,
+      statusCode,
+      details,
+    });
+    this.schedulePersist(rawConfig, logger);
+  }
+
+  noteFailFastError(params: {
+    routeKey: string;
+    statusCode?: number;
+    details?: string;
+    rawConfig?: PoolManagerConfig;
+    logger?: any;
+  }) {
+    const { routeKey, statusCode, details, rawConfig, logger } = params;
+    this.stats.failFastErrors += 1;
+    this.pushEvent({
+      type: "fail_fast_error",
+      routeKey,
+      statusCode,
+      details,
+    });
+    this.schedulePersist(rawConfig, logger);
+  }
+
+  noteFallbackAttempt(params: {
+    scenarioType: string;
+    routeKey: string;
+    rawConfig?: PoolManagerConfig;
+    logger?: any;
+  }) {
+    const { scenarioType, routeKey, rawConfig, logger } = params;
+    this.stats.fallbackAttempts += 1;
+    this.pushEvent({
+      type: "fallback_attempt",
+      scenarioType,
+      routeKey,
+    });
+    this.schedulePersist(rawConfig, logger);
+  }
+
+  noteFallbackSuccess(params: {
+    scenarioType: string;
+    routeKey: string;
+    rawConfig?: PoolManagerConfig;
+    logger?: any;
+  }) {
+    const { scenarioType, routeKey, rawConfig, logger } = params;
+    this.stats.fallbackSuccesses += 1;
+    this.pushEvent({
+      type: "fallback_success",
+      scenarioType,
+      routeKey,
+    });
+    this.schedulePersist(rawConfig, logger);
+  }
+
+  noteFallbackExhausted(params: {
+    scenarioType: string;
+    rawConfig?: PoolManagerConfig;
+    logger?: any;
+  }) {
+    const { scenarioType, rawConfig, logger } = params;
+    this.stats.fallbackExhausted += 1;
+    this.pushEvent({
+      type: "fallback_exhausted",
+      scenarioType,
+    });
+    this.schedulePersist(rawConfig, logger);
   }
 
   pickRoute(params: {
@@ -600,6 +843,12 @@ export class PoolManager {
           scenarioType,
           (index + 1) % uniqueCandidates.length
         );
+        this.noteSelectedRoute({
+          scenarioType,
+          routeKey: route,
+          rawConfig,
+          logger,
+        });
         this.schedulePersist(rawConfig, logger);
         logger?.info?.(
           {
@@ -627,6 +876,12 @@ export class PoolManager {
       scenarioType,
       (startIndex + 1) % uniqueCandidates.length
     );
+    this.noteSelectedRoute({
+      scenarioType,
+      routeKey: fallbackRoute,
+      rawConfig,
+      logger,
+    });
     this.schedulePersist(rawConfig, logger);
     return fallbackRoute;
   }
@@ -655,9 +910,27 @@ export class PoolManager {
   summary(rawConfig?: PoolManagerConfig) {
     const pool = this.snapshot(rawConfig);
     const failures = this.failureSnapshot(rawConfig);
+    const scenarioCursors = Array.from(this.scenarioCursors.entries()).map(
+      ([scenarioType, cursor]) => ({
+        scenarioType,
+        cursor,
+      })
+    );
+    const scenarioSelections = Array.from(this.scenarioSelections.entries()).map(
+      ([scenarioType, selection]) => ({
+        scenarioType,
+        routeKey: selection.routeKey,
+        selectedAt: selection.selectedAt,
+        count: selection.count,
+      })
+    );
     return {
       coolingProviders: pool.length,
       providersWithRecentFailures: failures.length,
+      stats: { ...this.stats },
+      scenarioCursors,
+      scenarioSelections,
+      recentEvents: [...this.recentEvents],
       pool,
       failures,
     };

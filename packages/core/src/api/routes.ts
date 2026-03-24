@@ -283,6 +283,13 @@ async function handleFallback(
         continue;
       }
 
+      poolManager.noteFallbackAttempt({
+        scenarioType,
+        routeKey: fallbackRouteKey,
+        rawConfig: poolManagerConfig,
+        logger: req.log,
+      });
+
       // Process request transformer chain
       const { requestBody, config, bypass } = await processRequestTransformers(
         newBody,
@@ -314,6 +321,12 @@ async function handleFallback(
       );
 
       poolManager.noteSuccess(fallbackRouteKey, poolManagerConfig, req.log);
+      poolManager.noteFallbackSuccess({
+        scenarioType,
+        routeKey: fallbackRouteKey,
+        rawConfig: poolManagerConfig,
+        logger: req.log,
+      });
       req.log.info(`Fallback model ${fallbackModel} succeeded`);
 
       // Format and return response
@@ -325,6 +338,11 @@ async function handleFallback(
   }
 
   req.log.error(`All fallback models failed for yichu ${scenarioType}`);
+  poolManager.noteFallbackExhausted({
+    scenarioType,
+    rawConfig: poolManagerConfig,
+    logger: req.log,
+  });
   return null;
 }
 
@@ -500,6 +518,13 @@ async function sendRequestToProvider(
       fastify.log
     );
   } catch (error: any) {
+      poolManager.noteRetryableFailure({
+        routeKey: `${provider.name},${requestBody.model}`,
+        reason: "transport_error",
+        details: error?.message,
+      rawConfig: poolManagerConfig,
+      logger: fastify.log,
+    });
       poolManager.markCooldown({
         routeKey: `${provider.name},${requestBody.model}`,
         reason: "transport_error",
@@ -518,6 +543,24 @@ async function sendRequestToProvider(
   if (!response.ok) {
     const errorText = await response.text();
       const failure = classifyProviderFailure(response.status, errorText);
+      if (failure.shouldFallback) {
+        poolManager.noteRetryableFailure({
+        routeKey: `${provider.name},${requestBody.model}`,
+          reason: failure.reason!,
+          statusCode: response.status,
+          details: errorText,
+          rawConfig: poolManagerConfig,
+          logger: fastify.log,
+        });
+      } else {
+        poolManager.noteFailFastError({
+        routeKey: `${provider.name},${requestBody.model}`,
+          statusCode: response.status,
+          details: errorText,
+          rawConfig: poolManagerConfig,
+          logger: fastify.log,
+        });
+      }
       if (failure.shouldCooldown && failure.reason) {
         poolManager.markCooldown({
         routeKey: `${provider.name},${requestBody.model}`,
@@ -666,7 +709,9 @@ export const registerApiRoutes = async (
               type: "string",
               enum: [
                 "http_429",
+                "quota_exhausted",
                 "http_503",
+                "high_demand",
                 "http_5xx",
                 "transport_error",
                 "manual_skip",

@@ -1,0 +1,32 @@
+name: ccr-fork-core-ci
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - feat/**
+
+jobs:
+  build-core:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build core workspaces
+        run: |
+          pnpm --filter @musistudio/llms build
+          pnpm --filter @CCR/shared build
+          pnpm --filter @CCR/server build
