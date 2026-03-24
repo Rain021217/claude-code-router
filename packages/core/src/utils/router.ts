@@ -7,6 +7,7 @@ import { CLAUDE_PROJECTS_DIR, HOME_DIR } from "@CCR/shared";
 import { LRUCache } from "lru-cache";
 import { ConfigService } from "../services/config";
 import { TokenizerService } from "../services/tokenizer";
+import { poolManager } from "./poolManager";
 
 // Types from @anthropic-ai/sdk
 interface Tool {
@@ -130,6 +131,32 @@ const getUseModel = async (
   const projectSpecificRouter = await getProjectSpecificRouter(req, configService);
   const providers = configService.get<any[]>("providers") || [];
   const Router = projectSpecificRouter || configService.get("Router");
+  const fallbackConfig = configService.get<any>("fallback") || {};
+  const poolManagerConfig = configService.get<any>("PoolManager");
+  const getRouteModel = (route?: string) =>
+    typeof route === "string" && route.includes(",")
+      ? route.split(",").slice(1).join(",")
+      : route;
+  const selectScenarioRoute = (
+    scenarioType: RouterScenarioType,
+    primaryRoute?: string
+  ) => {
+    const primaryModel = getRouteModel(primaryRoute);
+    const sameModelFallbacks = Array.isArray(fallbackConfig?.[scenarioType])
+      ? fallbackConfig[scenarioType].filter(
+          (route: string) => getRouteModel(route) === primaryModel
+        )
+      : [];
+    const selectedRoute =
+      poolManager.pickRoute({
+        scenarioType,
+        primaryRoute,
+        fallbackRoutes: sameModelFallbacks,
+        rawConfig: poolManagerConfig,
+        logger: req.log,
+      }) || primaryRoute;
+    return { model: selectedRoute, scenarioType };
+  };
 
   if (req.body.model.includes(",")) {
     const [provider, model] = req.body.model.split(",");
@@ -156,7 +183,7 @@ const getUseModel = async (
     req.log.info(
       `Using long context model due to token count: ${tokenCount}, threshold: ${longContextThreshold}`
     );
-    return { model: Router.longContext, scenarioType: 'longContext' };
+    return selectScenarioRoute('longContext', Router.longContext);
   }
   if (
     req.body?.system?.length > 1 &&
@@ -181,7 +208,7 @@ const getUseModel = async (
     globalRouter?.background
   ) {
     req.log.info(`Using background model for ${req.body.model}`);
-    return { model: globalRouter.background, scenarioType: 'background' };
+    return selectScenarioRoute('background', globalRouter.background);
   }
   // The priority of websearch must be higher than thinking.
   if (
@@ -189,14 +216,14 @@ const getUseModel = async (
     req.body.tools.some((tool: any) => tool.type?.startsWith("web_search")) &&
     Router?.webSearch
   ) {
-    return { model: Router.webSearch, scenarioType: 'webSearch' };
+    return selectScenarioRoute('webSearch', Router.webSearch);
   }
   // if exits thinking, use the think model
   if (req.body.thinking && Router?.think) {
     req.log.info(`Using think model for ${req.body.thinking}`);
-    return { model: Router.think, scenarioType: 'think' };
+    return selectScenarioRoute('think', Router.think);
   }
-  return { model: Router?.default, scenarioType: 'default' };
+  return selectScenarioRoute('default', Router?.default);
 };
 
 export interface RouterContext {

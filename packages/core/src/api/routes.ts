@@ -12,6 +12,7 @@ import { ConfigService } from "@/services/config";
 import { ProviderService } from "@/services/provider";
 import { TransformerService } from "@/services/transformer";
 import { Transformer } from "@/types/transformer";
+import { poolManager } from "@/utils/poolManager";
 
 // Extend FastifyInstance to include custom services
 declare module "fastify" {
@@ -31,6 +32,45 @@ declare module "fastify" {
  * Coordinates the entire request processing flow: validate provider, handle request transformers,
  * send request, handle response transformers, format response
  */
+function shouldAttemptFallback(error: any) {
+  if (!error) return false;
+  const statusCode = Number(error.statusCode || error.status || 0);
+  return statusCode === 429 || statusCode === 503 || statusCode >= 500;
+}
+
+function classifyProviderFailure(statusCode: number) {
+  if (statusCode === 429) {
+    return {
+      code: "provider_retryable_error",
+      shouldCooldown: true,
+      shouldFallback: true,
+      reason: "http_429" as const,
+    };
+  }
+  if (statusCode === 503) {
+    return {
+      code: "provider_retryable_error",
+      shouldCooldown: true,
+      shouldFallback: true,
+      reason: "http_503" as const,
+    };
+  }
+  if (statusCode >= 500) {
+    return {
+      code: "provider_retryable_error",
+      shouldCooldown: true,
+      shouldFallback: true,
+      reason: "http_5xx" as const,
+    };
+  }
+  return {
+    code: "provider_fail_fast_error",
+    shouldCooldown: false,
+    shouldFallback: false,
+    reason: null,
+  };
+}
+
 async function handleTransformerEndpoint(
   req: FastifyRequest,
   reply: FastifyReply,
@@ -40,6 +80,7 @@ async function handleTransformerEndpoint(
   const body = req.body as any;
   const providerName = req.provider!;
   const provider = fastify.providerService.getProvider(providerName);
+  const poolManagerConfig = fastify.configService.get<any>("PoolManager");
 
   // Validate provider exists
   if (!provider) {
@@ -47,6 +88,26 @@ async function handleTransformerEndpoint(
       `Provider '${providerName}' not found`,
       404,
       "provider_not_found"
+    );
+  }
+
+  if (poolManager.isCooling(providerName, poolManagerConfig)) {
+    const remainingMs = poolManager.getRemainingMs(
+      providerName,
+      poolManagerConfig
+    );
+    req.log.warn(
+      {
+        providerName,
+        scenarioType: (req as any).scenarioType || "default",
+        remainingMs,
+      },
+      "[PoolManager] primary provider is cooling, falling back"
+    );
+    throw createApiError(
+      `Provider ${providerName} is cooling down for another ${remainingMs}ms`,
+      503,
+      "provider_response_error"
     );
   }
 
@@ -90,9 +151,24 @@ async function handleTransformerEndpoint(
     // Format and return response
     return formatResponse(finalResponse, reply, body);
   } catch (error: any) {
-    // Handle fallback if error occurs
-    if (error.code === 'provider_response_error') {
-      const fallbackResult = await handleFallback(req, reply, fastify, transformer, error);
+    req.log.warn(
+      {
+        providerName,
+        scenarioType: (req as any).scenarioType || "default",
+        errorCode: error?.code,
+        statusCode: error?.statusCode || error?.status,
+        message: error?.message,
+      },
+      "[PoolManager] request failed in primary provider"
+    );
+    if (shouldAttemptFallback(error)) {
+      const fallbackResult = await handleFallback(
+        req,
+        reply,
+        fastify,
+        transformer,
+        error
+      );
       if (fallbackResult) {
         return fallbackResult;
       }
@@ -114,13 +190,22 @@ async function handleFallback(
 ): Promise<any> {
   const scenarioType = (req as any).scenarioType || 'default';
   const fallbackConfig = fastify.configService.get<any>('fallback');
+  const poolManagerConfig = fastify.configService.get<any>("PoolManager");
 
   if (!fallbackConfig || !fallbackConfig[scenarioType]) {
+    req.log.warn(
+      { scenarioType, hasFallbackConfig: Boolean(fallbackConfig) },
+      "[PoolManager] no fallback configuration for scenario"
+    );
     return null;
   }
 
   const fallbackList = fallbackConfig[scenarioType] as string[];
   if (!Array.isArray(fallbackList) || fallbackList.length === 0) {
+    req.log.warn(
+      { scenarioType },
+      "[PoolManager] fallback list is empty"
+    );
     return null;
   }
 
@@ -146,6 +231,22 @@ async function handleFallback(
       const provider = fastify.providerService.getProvider(fallbackProvider);
       if (!provider) {
         req.log.warn(`Fallback provider '${fallbackProvider}' not found, skipping`);
+        continue;
+      }
+
+      if (poolManager.isCooling(fallbackProvider, poolManagerConfig)) {
+        const remainingMs = poolManager.getRemainingMs(
+          fallbackProvider,
+          poolManagerConfig
+        );
+        req.log.warn(
+          {
+            fallbackProvider,
+            fallbackModel,
+            remainingMs,
+          },
+          "[PoolManager] skipping cooling fallback provider"
+        );
         continue;
       }
 
@@ -179,6 +280,7 @@ async function handleFallback(
         { req: newReq }
       );
 
+      poolManager.noteSuccess(fallbackProvider, req.log);
       req.log.info(`Fallback model ${fallbackModel} succeeded`);
 
       // Format and return response
@@ -307,6 +409,7 @@ async function sendRequestToProvider(
   context: any
 ) {
   const url = config.url || new URL(provider.baseUrl);
+  const poolManagerConfig = fastify.configService.get<any>("PoolManager");
 
   // Handle authentication in passthrough mode
   if (bypass && typeof transformer.auth === "function") {
@@ -350,30 +453,59 @@ async function sendRequestToProvider(
     }
   }
 
-  const response = await sendUnifiedRequest(
-    url,
-    requestBody,
-    {
-      httpsProxy: fastify.configService.getHttpsProxy(),
-      ...config,
-      headers: JSON.parse(JSON.stringify(requestHeaders)),
-    },
-    context,
-    fastify.log
-  );
+  let response: Response;
+  try {
+    response = await sendUnifiedRequest(
+      url,
+      requestBody,
+      {
+        httpsProxy: fastify.configService.getHttpsProxy(),
+        ...config,
+        headers: JSON.parse(JSON.stringify(requestHeaders)),
+      },
+      context,
+      fastify.log
+    );
+  } catch (error: any) {
+    poolManager.markCooldown({
+      providerName: provider.name,
+      reason: "transport_error",
+      message: error?.message,
+      rawConfig: poolManagerConfig,
+      logger: fastify.log,
+    });
+    throw createApiError(
+      `Transport error from provider(${provider.name},${requestBody.model}): ${error?.message || error}`,
+      503,
+      "provider_retryable_error"
+    );
+  }
 
   // Handle request errors
   if (!response.ok) {
     const errorText = await response.text();
+    const failure = classifyProviderFailure(response.status);
+    if (failure.shouldCooldown && failure.reason) {
+      poolManager.markCooldown({
+        providerName: provider.name,
+        reason: failure.reason,
+        statusCode: response.status,
+        message: errorText,
+        rawConfig: poolManagerConfig,
+        logger: fastify.log,
+      });
+    }
     fastify.log.error(
       `[provider_response_error] Error from provider(${provider.name},${requestBody.model}: ${response.status}): ${errorText}`,
     );
     throw createApiError(
       `Error from provider(${provider.name},${requestBody.model}: ${response.status}): ${errorText}`,
       response.status,
-      "provider_response_error"
+      failure.code
     );
   }
+
+  poolManager.noteSuccess(provider.name, fastify.log);
 
   return response;
 }
@@ -472,6 +604,16 @@ export const registerApiRoutes = async (
 
   fastify.get("/health", async () => {
     return { status: "ok", timestamp: new Date().toISOString() };
+  });
+
+  fastify.get("/health/pool", async () => {
+    const poolManagerConfig = fastify.configService.get<any>("PoolManager");
+    return {
+      status: "ok",
+      timestamp: new Date().toISOString(),
+      pool: poolManager.snapshot(poolManagerConfig),
+      failures: poolManager.failureSnapshot(poolManagerConfig),
+    };
   });
 
   const transformersWithEndpoint =
