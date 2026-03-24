@@ -12,7 +12,10 @@ import { ConfigService } from "@/services/config";
 import { ProviderService } from "@/services/provider";
 import { TransformerService } from "@/services/transformer";
 import { Transformer } from "@/types/transformer";
-import { poolManager } from "@/utils/poolManager";
+import {
+  poolManager,
+  PoolManagerCooldownReason,
+} from "@/utils/poolManager";
 
 // Extend FastifyInstance to include custom services
 declare module "fastify" {
@@ -81,6 +84,7 @@ async function handleTransformerEndpoint(
   const providerName = req.provider!;
   const provider = fastify.providerService.getProvider(providerName);
   const poolManagerConfig = fastify.configService.get<any>("PoolManager");
+  const routeKey = `${providerName},${body.model}`;
 
   // Validate provider exists
   if (!provider) {
@@ -91,27 +95,27 @@ async function handleTransformerEndpoint(
     );
   }
 
-  if (poolManager.isCooling(providerName, poolManagerConfig)) {
-    const remainingMs = poolManager.getRemainingMs(
-      providerName,
-      poolManagerConfig
-    );
-    req.log.warn(
-      {
-        providerName,
-        scenarioType: (req as any).scenarioType || "default",
-        remainingMs,
-      },
-      "[PoolManager] primary provider is cooling, falling back"
-    );
-    throw createApiError(
-      `Provider ${providerName} is cooling down for another ${remainingMs}ms`,
-      503,
-      "provider_response_error"
-    );
-  }
-
   try {
+    if (poolManager.isCooling(routeKey, poolManagerConfig)) {
+      const remainingMs = poolManager.getRemainingMs(
+        routeKey,
+        poolManagerConfig
+      );
+      req.log.warn(
+        {
+          routeKey,
+          scenarioType: (req as any).scenarioType || "default",
+          remainingMs,
+        },
+        "[PoolManager] primary provider is cooling, falling back"
+      );
+      throw createApiError(
+        `Route ${routeKey} is cooling down for another ${remainingMs}ms`,
+        503,
+        "provider_response_error"
+      );
+    }
+
     // Process request transformer chain
     const { requestBody, config, bypass } = await processRequestTransformers(
       body,
@@ -153,7 +157,7 @@ async function handleTransformerEndpoint(
   } catch (error: any) {
     req.log.warn(
       {
-        providerName,
+        routeKey,
         scenarioType: (req as any).scenarioType || "default",
         errorCode: error?.code,
         statusCode: error?.statusCode || error?.status,
@@ -220,6 +224,7 @@ async function handleFallback(
       const newBody = { ...(req.body as any) };
       const [fallbackProvider, ...fallbackModelName] = fallbackModel.split(',');
       newBody.model = fallbackModelName.join(',');
+      const fallbackRouteKey = fallbackModel;
 
       // Create new request object with updated provider and body
       const newReq = {
@@ -234,14 +239,14 @@ async function handleFallback(
         continue;
       }
 
-      if (poolManager.isCooling(fallbackProvider, poolManagerConfig)) {
+      if (poolManager.isCooling(fallbackRouteKey, poolManagerConfig)) {
         const remainingMs = poolManager.getRemainingMs(
-          fallbackProvider,
+          fallbackRouteKey,
           poolManagerConfig
         );
         req.log.warn(
           {
-            fallbackProvider,
+            fallbackRouteKey,
             fallbackModel,
             remainingMs,
           },
@@ -280,7 +285,7 @@ async function handleFallback(
         { req: newReq }
       );
 
-      poolManager.noteSuccess(fallbackProvider, req.log);
+      poolManager.noteSuccess(fallbackRouteKey, req.log);
       req.log.info(`Fallback model ${fallbackModel} succeeded`);
 
       // Format and return response
@@ -467,10 +472,10 @@ async function sendRequestToProvider(
       fastify.log
     );
   } catch (error: any) {
-    poolManager.markCooldown({
-      providerName: provider.name,
-      reason: "transport_error",
-      message: error?.message,
+      poolManager.markCooldown({
+        routeKey: `${provider.name},${requestBody.model}`,
+        reason: "transport_error",
+        message: error?.message,
       rawConfig: poolManagerConfig,
       logger: fastify.log,
     });
@@ -484,12 +489,12 @@ async function sendRequestToProvider(
   // Handle request errors
   if (!response.ok) {
     const errorText = await response.text();
-    const failure = classifyProviderFailure(response.status);
-    if (failure.shouldCooldown && failure.reason) {
-      poolManager.markCooldown({
-        providerName: provider.name,
-        reason: failure.reason,
-        statusCode: response.status,
+      const failure = classifyProviderFailure(response.status);
+      if (failure.shouldCooldown && failure.reason) {
+        poolManager.markCooldown({
+        routeKey: `${provider.name},${requestBody.model}`,
+          reason: failure.reason,
+          statusCode: response.status,
         message: errorText,
         rawConfig: poolManagerConfig,
         logger: fastify.log,
@@ -505,7 +510,7 @@ async function sendRequestToProvider(
     );
   }
 
-  poolManager.noteSuccess(provider.name, fastify.log);
+  poolManager.noteSuccess(`${provider.name},${requestBody.model}`, fastify.log);
 
   return response;
 }
@@ -608,13 +613,131 @@ export const registerApiRoutes = async (
 
   fastify.get("/health/pool", async () => {
     const poolManagerConfig = fastify.configService.get<any>("PoolManager");
+    const summary = poolManager.summary(poolManagerConfig);
     return {
       status: "ok",
       timestamp: new Date().toISOString(),
-      pool: poolManager.snapshot(poolManagerConfig),
-      failures: poolManager.failureSnapshot(poolManagerConfig),
+      ...summary,
     };
   });
+
+  fastify.post(
+    "/health/pool/cooldown",
+    {
+      schema: {
+        body: {
+          type: "object",
+          properties: {
+            providerName: { type: "string" },
+            routeKey: { type: "string" },
+            reason: {
+              type: "string",
+              enum: [
+                "http_429",
+                "http_503",
+                "http_5xx",
+                "transport_error",
+                "manual_skip",
+              ],
+            },
+            statusCode: { type: "number" },
+            message: { type: "string" },
+            cooldownMs: { type: "number" },
+          },
+          anyOf: [
+            { required: ["routeKey"] },
+            { required: ["providerName"] }
+          ],
+        },
+      },
+    },
+    async (req: FastifyRequest, reply: FastifyReply) => {
+      const poolManagerConfig = fastify.configService.get<any>("PoolManager");
+      const {
+        providerName,
+        routeKey,
+        reason,
+        statusCode,
+        message,
+        cooldownMs,
+      } = (req.body as any) || {};
+
+      const effectiveRouteKey =
+        routeKey ||
+        (providerName && typeof providerName === "string"
+          ? `${providerName},unknown`
+          : null);
+
+      if (!effectiveRouteKey) {
+        throw createApiError(
+          "routeKey or providerName is required",
+          400,
+          "invalid_request"
+        );
+      }
+
+      if (providerName && !fastify.providerService.getProvider(providerName)) {
+        throw createApiError(
+          `Provider '${providerName}' not found`,
+          404,
+          "provider_not_found"
+        );
+      }
+
+      poolManager.forceCooldown({
+        routeKey: effectiveRouteKey,
+        reason: reason as PoolManagerCooldownReason | undefined,
+        statusCode,
+        message,
+        cooldownMs,
+        rawConfig: poolManagerConfig,
+        logger: req.log,
+      });
+
+      reply.code(202);
+      return {
+        status: "accepted",
+        timestamp: new Date().toISOString(),
+        routeKey: effectiveRouteKey,
+        summary: poolManager.summary(poolManagerConfig),
+      };
+    }
+  );
+
+  fastify.delete(
+    "/health/pool",
+    {
+      schema: {
+        querystring: {
+          type: "object",
+          properties: {
+            providerName: { type: "string" },
+            routeKey: { type: "string" },
+          },
+        },
+      },
+    },
+    async (req: FastifyRequest, reply: FastifyReply) => {
+      const poolManagerConfig = fastify.configService.get<any>("PoolManager");
+      const providerName = (req.query as any)?.providerName;
+      const routeKey = (req.query as any)?.routeKey;
+      const effectiveRouteKey = routeKey || providerName;
+
+      if (effectiveRouteKey) {
+        poolManager.clearCooldown(effectiveRouteKey, req.log);
+      } else {
+        poolManager.clearAll(req.log);
+      }
+
+      reply.code(202);
+      return {
+        status: "accepted",
+        timestamp: new Date().toISOString(),
+        routeKey: effectiveRouteKey || null,
+        summary: poolManager.summary(poolManagerConfig),
+      };
+    }
+  );
 
   const transformersWithEndpoint =
     fastify.transformerService.getTransformersWithEndpoint();

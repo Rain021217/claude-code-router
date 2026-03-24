@@ -6,7 +6,7 @@ type CooldownReason =
   | "manual_skip";
 
 interface ProviderCooldownState {
-  providerName: string;
+  routeKey: string;
   cooldownUntil: number;
   reason: CooldownReason;
   statusCode?: number;
@@ -45,6 +45,8 @@ const DEFAULT_CONFIG: Required<PoolManagerConfig> = {
     "504": 30_000,
   },
 };
+
+export type PoolManagerCooldownReason = CooldownReason;
 
 export class PoolManager {
   private readonly providerStates = new Map<string, ProviderCooldownState>();
@@ -98,29 +100,29 @@ export class PoolManager {
     if (!route || !route.includes(",")) {
       return null;
     }
-    return route.split(",")[0] || null;
+    return route;
   }
 
-  isCooling(providerName: string, rawConfig?: PoolManagerConfig): boolean {
+  isCooling(routeKey: string, rawConfig?: PoolManagerConfig): boolean {
     const config = this.getConfig(rawConfig);
     if (!config.enabled) {
       return false;
     }
     this.cleanupExpired(rawConfig);
-    const state = this.providerStates.get(providerName);
+    const state = this.providerStates.get(routeKey);
     return !!state && state.cooldownUntil > Date.now();
   }
 
-  getState(providerName: string, rawConfig?: PoolManagerConfig) {
+  getState(routeKey: string, rawConfig?: PoolManagerConfig) {
     this.cleanupExpired(rawConfig);
-    if (!this.isCooling(providerName, rawConfig)) {
+    if (!this.isCooling(routeKey, rawConfig)) {
       return null;
     }
-    return this.providerStates.get(providerName) || null;
+    return this.providerStates.get(routeKey) || null;
   }
 
-  getRemainingMs(providerName: string, rawConfig?: PoolManagerConfig): number {
-    const state = this.getState(providerName, rawConfig);
+  getRemainingMs(routeKey: string, rawConfig?: PoolManagerConfig): number {
+    const state = this.getState(routeKey, rawConfig);
     if (!state) {
       return 0;
     }
@@ -169,14 +171,14 @@ export class PoolManager {
   }
 
   markCooldown(params: {
-    providerName: string;
+    routeKey: string;
     reason: CooldownReason;
     statusCode?: number;
     message?: string;
     rawConfig?: PoolManagerConfig;
     logger?: any;
   }) {
-    const { providerName, reason, statusCode, message, rawConfig, logger } =
+    const { routeKey, reason, statusCode, message, rawConfig, logger } =
       params;
     const config = this.getConfig(rawConfig);
     if (!config.enabled) {
@@ -184,14 +186,14 @@ export class PoolManager {
     }
 
     const now = Date.now();
-    const failureCounter = this.failureCounters.get(providerName);
+    const failureCounter = this.failureCounters.get(routeKey);
     const consecutiveFailures =
       failureCounter &&
       now - failureCounter.updatedAt <= config.failureWindowMs
         ? failureCounter.count + 1
         : 1;
 
-    this.failureCounters.set(providerName, {
+    this.failureCounters.set(routeKey, {
       count: consecutiveFailures,
       updatedAt: now,
         lastStatusCode: statusCode,
@@ -207,7 +209,7 @@ export class PoolManager {
     if (consecutiveFailures < allowedFails) {
       logger?.info?.(
         {
-          providerName,
+          routeKey,
           reason,
           statusCode,
           consecutiveFailures,
@@ -224,7 +226,7 @@ export class PoolManager {
         : this.getCooldownMsForStatus(statusCode, rawConfig);
 
     const state: ProviderCooldownState = {
-      providerName,
+      routeKey,
       cooldownUntil: now + cooldownMs,
       reason,
       statusCode,
@@ -233,10 +235,10 @@ export class PoolManager {
       updatedAt: now,
     };
 
-    this.providerStates.set(providerName, state);
+    this.providerStates.set(routeKey, state);
     logger?.warn?.(
       {
-        providerName,
+        routeKey,
         reason,
         statusCode,
         cooldownMs,
@@ -247,22 +249,95 @@ export class PoolManager {
     );
   }
 
-  clearCooldown(providerName: string, logger?: any) {
-    if (this.providerStates.delete(providerName)) {
-      logger?.info?.({ providerName }, "[PoolManager] provider cooldown cleared");
+  clearCooldown(routeKey: string, logger?: any) {
+    if (this.providerStates.delete(routeKey)) {
+      logger?.info?.({ routeKey }, "[PoolManager] provider cooldown cleared");
     }
-    this.failureCounters.delete(providerName);
+    this.failureCounters.delete(routeKey);
   }
 
-  noteSuccess(providerName: string, logger?: any) {
-    this.failureCounters.delete(providerName);
-    const existing = this.providerStates.get(providerName);
+  clearAll(logger?: any) {
+    const cooldownCount = this.providerStates.size;
+    const failureCount = this.failureCounters.size;
+    this.providerStates.clear();
+    this.failureCounters.clear();
+    logger?.info?.(
+      { cooldownCount, failureCount },
+      "[PoolManager] cleared all cooldown and failure state"
+    );
+  }
+
+  forceCooldown(params: {
+    routeKey: string;
+    reason?: CooldownReason;
+    statusCode?: number;
+    message?: string;
+    cooldownMs?: number;
+    rawConfig?: PoolManagerConfig;
+    logger?: any;
+  }) {
+    const {
+      routeKey,
+      reason = "manual_skip",
+      statusCode,
+      message,
+      cooldownMs,
+      rawConfig,
+      logger,
+    } = params;
+    const config = this.getConfig(rawConfig);
+    if (!config.enabled) {
+      return;
+    }
+
+    const now = Date.now();
+    const resolvedCooldownMs =
+      typeof cooldownMs === "number" && cooldownMs > 0
+        ? cooldownMs
+        : reason === "transport_error"
+          ? config.transportCooldownMs
+          : this.getCooldownMsForStatus(statusCode, rawConfig);
+
+    const previousFailureCount =
+      this.failureCounters.get(routeKey)?.count || 0;
+
+    this.failureCounters.set(routeKey, {
+      count: Math.max(previousFailureCount, 1),
+      updatedAt: now,
+      lastStatusCode: statusCode,
+      lastError: message || "forced cooldown",
+    });
+
+    this.providerStates.set(routeKey, {
+      routeKey,
+      cooldownUntil: now + resolvedCooldownMs,
+      reason,
+      statusCode,
+      lastError: message || "forced cooldown",
+      consecutiveFailures: Math.max(previousFailureCount, 1),
+      updatedAt: now,
+    });
+
+    logger?.warn?.(
+      {
+        routeKey,
+        reason,
+        statusCode,
+        cooldownMs: resolvedCooldownMs,
+      },
+      "[PoolManager] provider manually forced into cooldown"
+    );
+  }
+
+  noteSuccess(routeKey: string, logger?: any) {
+    this.failureCounters.delete(routeKey);
+    const existing = this.providerStates.get(routeKey);
     if (!existing) {
       return;
     }
-    this.providerStates.delete(providerName);
+    this.providerStates.delete(routeKey);
     logger?.info?.(
-      { providerName },
+      { routeKey },
       "[PoolManager] provider removed from cooldown after success"
     );
   }
@@ -301,8 +376,8 @@ export class PoolManager {
     for (let offset = 0; offset < uniqueCandidates.length; offset += 1) {
       const index = (startIndex + offset) % uniqueCandidates.length;
       const route = uniqueCandidates[index];
-      const providerName = this.parseProviderName(route);
-      if (!providerName || !this.isCooling(providerName, rawConfig)) {
+      const routeKey = this.parseProviderName(route);
+      if (!routeKey || !this.isCooling(routeKey, rawConfig)) {
         this.scenarioCursors.set(
           scenarioType,
           (index + 1) % uniqueCandidates.length
@@ -339,22 +414,33 @@ export class PoolManager {
   snapshot(rawConfig?: PoolManagerConfig): ProviderCooldownState[] {
     this.cleanupExpired(rawConfig);
     return Array.from(this.providerStates.values()).filter((state) =>
-      this.isCooling(state.providerName, rawConfig)
+      this.isCooling(state.routeKey, rawConfig)
     );
   }
 
   failureSnapshot(rawConfig?: PoolManagerConfig) {
     const config = this.getConfig(rawConfig);
-    this.cleanupExpired();
+    this.cleanupExpired(rawConfig);
     return Array.from(this.failureCounters.entries())
       .filter(([, counter]) => Date.now() - counter.updatedAt <= config.failureWindowMs)
-      .map(([providerName, counter]) => ({
-        providerName,
+      .map(([routeKey, counter]) => ({
+        routeKey,
         count: counter.count,
         updatedAt: counter.updatedAt,
         lastStatusCode: counter.lastStatusCode,
         lastError: counter.lastError,
       }));
+  }
+
+  summary(rawConfig?: PoolManagerConfig) {
+    const pool = this.snapshot(rawConfig);
+    const failures = this.failureSnapshot(rawConfig);
+    return {
+      coolingProviders: pool.length,
+      providersWithRecentFailures: failures.length,
+      pool,
+      failures,
+    };
   }
 }
 
