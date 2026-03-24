@@ -41,13 +41,33 @@ function shouldAttemptFallback(error: any) {
   return statusCode === 429 || statusCode === 503 || statusCode >= 500;
 }
 
-function classifyProviderFailure(statusCode: number) {
+function classifyProviderFailure(statusCode: number, errorText?: string) {
+  const normalizedError = String(errorText || "").toLowerCase();
+  const isQuotaExhausted =
+    normalizedError.includes("resource_exhausted") ||
+    normalizedError.includes("quota") ||
+    normalizedError.includes("rate limit") ||
+    normalizedError.includes("rate_limit") ||
+    normalizedError.includes("too many requests");
+  const isHighDemand =
+    normalizedError.includes("high demand") ||
+    normalizedError.includes("currently experiencing high demand") ||
+    normalizedError.includes("temporarily overloaded");
+
   if (statusCode === 429) {
     return {
       code: "provider_retryable_error",
       shouldCooldown: true,
       shouldFallback: true,
-      reason: "http_429" as const,
+      reason: isQuotaExhausted ? ("quota_exhausted" as const) : ("http_429" as const),
+    };
+  }
+  if (isQuotaExhausted) {
+    return {
+      code: "provider_retryable_error",
+      shouldCooldown: true,
+      shouldFallback: true,
+      reason: "quota_exhausted" as const,
     };
   }
   if (statusCode === 503) {
@@ -55,7 +75,15 @@ function classifyProviderFailure(statusCode: number) {
       code: "provider_retryable_error",
       shouldCooldown: true,
       shouldFallback: true,
-      reason: "http_503" as const,
+      reason: isHighDemand ? ("high_demand" as const) : ("http_503" as const),
+    };
+  }
+  if (isHighDemand) {
+    return {
+      code: "provider_retryable_error",
+      shouldCooldown: true,
+      shouldFallback: true,
+      reason: "high_demand" as const,
     };
   }
   if (statusCode >= 500) {
@@ -489,7 +517,7 @@ async function sendRequestToProvider(
   // Handle request errors
   if (!response.ok) {
     const errorText = await response.text();
-      const failure = classifyProviderFailure(response.status);
+      const failure = classifyProviderFailure(response.status, errorText);
       if (failure.shouldCooldown && failure.reason) {
         poolManager.markCooldown({
         routeKey: `${provider.name},${requestBody.model}`,

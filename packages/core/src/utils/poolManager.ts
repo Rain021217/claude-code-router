@@ -3,7 +3,9 @@ import { dirname } from "path";
 
 type CooldownReason =
   | "http_429"
+  | "quota_exhausted"
   | "http_503"
+  | "high_demand"
   | "http_5xx"
   | "transport_error"
   | "manual_skip";
@@ -38,7 +40,9 @@ const DEFAULT_CONFIG: Required<PoolManagerConfig> = {
   allowedFails: 1,
   allowedFailsPolicy: {
     "429": 1,
+    quota_exhausted: 1,
     "503": 1,
+    high_demand: 1,
     "5xx": 2,
     transport_error: 2,
   },
