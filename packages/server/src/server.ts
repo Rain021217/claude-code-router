@@ -1,6 +1,8 @@
 import Server, { calculateTokenCount, TokenizerService } from "@musistudio/llms";
 import { readConfigFile, writeConfigFile, backupConfigFile } from "./utils";
 import { join } from "path";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import fastifyStatic from "@fastify/static";
 import { readdirSync, statSync, readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync, rmSync } from "fs";
 import { homedir } from "os";
@@ -25,9 +27,191 @@ import {
 import fastifyMultipart from "@fastify/multipart";
 import AdmZip from "adm-zip";
 
+const execFileAsync = promisify(execFile);
+
 export const createServer = async (config: any): Promise<any> => {
   const server = new Server(config);
   const app = server.app;
+
+  const getA2GPaths = () => {
+    const homeA2GDir = join(HOME_DIR, "a2g");
+    return {
+      specPath: process.env.A2G_CONFIG_SPEC_PATH || "",
+      generatorPath: process.env.A2G_GENERATOR_SCRIPT_PATH || "",
+      validatorPath: process.env.A2G_VALIDATOR_SCRIPT_PATH || "",
+      generatedConfigPath:
+        process.env.A2G_GENERATED_CONFIG_PATH || join(HOME_DIR, "config.json"),
+      sourceOfTruth:
+        process.env.A2G_SOURCE_OF_TRUTH ||
+        "config.spec.json -> generate -> config.json -> Git",
+      pythonBin: process.env.A2G_PYTHON_BIN || "python3",
+      pythonPath: process.env.A2G_PYTHONPATH || "",
+      draftsDir:
+        process.env.A2G_DRAFTS_DIR || join(HOME_DIR, "state", "a2g-drafts"),
+      tmpDir: join(homeA2GDir, "tmp"),
+    };
+  };
+
+  const resolveAdminApiKey = (configuredValue?: string) => {
+    if (!configuredValue) {
+      return "";
+    }
+    if (configuredValue.startsWith("$")) {
+      return process.env[configuredValue.slice(1)] || "";
+    }
+    return configuredValue;
+  };
+
+  const ensureA2GDir = (dirPath: string) => {
+    if (!existsSync(dirPath)) {
+      mkdirSync(dirPath, { recursive: true });
+    }
+  };
+
+  const readJsonFile = (filePath: string) =>
+    JSON.parse(readFileSync(filePath, "utf-8"));
+
+  const getDraftFilePath = (draftId = "default") => {
+    const { draftsDir } = getA2GPaths();
+    ensureA2GDir(draftsDir);
+    return join(draftsDir, `${draftId}.spec.json`);
+  };
+
+  const loadDraftSpec = (draftId = "default") => {
+    const draftPath = getDraftFilePath(draftId);
+    const { specPath } = getA2GPaths();
+    if (existsSync(draftPath)) {
+      return { draftId, source: "draft", spec: readJsonFile(draftPath) };
+    }
+    if (specPath && existsSync(specPath)) {
+      return { draftId, source: "spec", spec: readJsonFile(specPath) };
+    }
+    return { draftId, source: "empty", spec: {} };
+  };
+
+  const saveDraftSpec = (draftId: string, spec: Record<string, unknown>) => {
+    const draftPath = getDraftFilePath(draftId);
+    writeFileSync(draftPath, `${JSON.stringify(spec, null, 2)}\n`, "utf-8");
+    return draftPath;
+  };
+
+  const summarizeGeneratedConfig = (generatedConfig: Record<string, any>) => {
+    const router = generatedConfig.Router || {};
+    const fallback = generatedConfig.fallback || {};
+    return {
+      providerCount: Array.isArray(generatedConfig.Providers)
+        ? generatedConfig.Providers.length
+        : 0,
+      scenarioCount: Object.keys(router).filter(
+        (key) => key !== "longContextThreshold",
+      ).length,
+      fallbackScenarioCount:
+        fallback && typeof fallback === "object" ? Object.keys(fallback).length : 0,
+    };
+  };
+
+  const runA2GScript = async (scriptPath: string, args: string[]) => {
+    const { pythonBin, pythonPath } = getA2GPaths();
+    return execFileAsync(pythonBin, [scriptPath, ...args], {
+      env: {
+        ...process.env,
+        ...(pythonPath ? { PYTHONPATH: pythonPath } : {}),
+      },
+    });
+  };
+
+  const formatA2GScriptError = (error: any) => {
+    const rawMessage =
+      error?.stderr || error?.stdout || error?.message || "unknown error";
+    const missingFieldMatch = /KeyError: '([^']+)'/.exec(rawMessage);
+    if (missingFieldMatch) {
+      return {
+        statusCode: 400,
+        error: "Invalid draft payload",
+        message: `Missing required field: ${missingFieldMatch[1]}`,
+        details: rawMessage,
+      };
+    }
+    const valueErrorMatch = /ValueError\((?:[^)]*)\):?(.+)|ValueError:\s+(.+)/s.exec(
+      rawMessage,
+    );
+    if (valueErrorMatch) {
+      return {
+        statusCode: 400,
+        error: "Invalid draft payload",
+        message: (valueErrorMatch[1] || valueErrorMatch[2] || rawMessage).trim(),
+        details: rawMessage,
+      };
+    }
+    return {
+      statusCode: 500,
+      error: "A2G script execution failed",
+      message: rawMessage,
+      details: rawMessage,
+    };
+  };
+
+  const runA2GGenerate = async (spec: Record<string, unknown>) => {
+    const { generatorPath, tmpDir } = getA2GPaths();
+    if (!generatorPath || !existsSync(generatorPath)) {
+      throw new Error("A2G generator script is not available");
+    }
+    ensureA2GDir(tmpDir);
+    const runDir = join(
+      tmpDir,
+      `${Date.now()}-${Math.random().toString(16).slice(2, 8)}`,
+    );
+    ensureA2GDir(runDir);
+    const specFile = join(runDir, "draft.spec.json");
+    const outputFile = join(runDir, "generated.config.json");
+    try {
+      writeFileSync(specFile, `${JSON.stringify(spec, null, 2)}\n`, "utf-8");
+      await runA2GScript(generatorPath, [
+        "--spec",
+        specFile,
+        "--output",
+        outputFile,
+      ]);
+      return readJsonFile(outputFile);
+    } finally {
+      rmSync(runDir, { recursive: true, force: true });
+    }
+  };
+
+  const runA2GValidate = async (spec: Record<string, unknown>) => {
+    const { validatorPath, generatedConfigPath, tmpDir } = getA2GPaths();
+    if (!validatorPath || !existsSync(validatorPath)) {
+      throw new Error("A2G validator script is not available");
+    }
+    ensureA2GDir(tmpDir);
+    const runDir = join(
+      tmpDir,
+      `${Date.now()}-${Math.random().toString(16).slice(2, 8)}`,
+    );
+    ensureA2GDir(runDir);
+    const specFile = join(runDir, "draft.spec.json");
+    try {
+      writeFileSync(specFile, `${JSON.stringify(spec, null, 2)}\n`, "utf-8");
+      await runA2GScript(validatorPath, [
+        "--spec",
+        specFile,
+        "--config",
+        generatedConfigPath,
+      ]);
+      return {
+        ok: true,
+        message: "router config is in sync",
+      };
+    } catch (error: any) {
+      return {
+        ok: false,
+        message:
+          error?.stderr || error?.stdout || error?.message || "validation failed",
+      };
+    } finally {
+      rmSync(runDir, { recursive: true, force: true });
+    }
+  };
 
   app.register(fastifyMultipart, {
     limits: {
@@ -116,16 +300,20 @@ export const createServer = async (config: any): Promise<any> => {
   app.get("/api/a2g/control-plane", async (_req: any, reply: any) => {
     try {
       const config = await readConfigFile();
-      const specPath = process.env.A2G_CONFIG_SPEC_PATH || "";
-      const generatorPath = process.env.A2G_GENERATOR_SCRIPT_PATH || "";
-      const validatorPath = process.env.A2G_VALIDATOR_SCRIPT_PATH || "";
-      const generatedConfigPath = process.env.A2G_GENERATED_CONFIG_PATH || join(HOME_DIR, "config.json");
-      const sourceOfTruth =
-        process.env.A2G_SOURCE_OF_TRUTH || "config.spec.json -> generate -> config.json -> Git";
+      const {
+        specPath,
+        generatorPath,
+        validatorPath,
+        generatedConfigPath,
+        sourceOfTruth,
+      } = getA2GPaths();
 
       const poolResponse = await app.inject({
         method: "GET",
         url: "/health/pool",
+        headers: {
+          "x-api-key": resolveAdminApiKey(config.APIKEY),
+        },
       });
 
       const poolData = poolResponse.statusCode === 200
@@ -199,15 +387,124 @@ export const createServer = async (config: any): Promise<any> => {
           recentEvents: Array.isArray(poolData.recentEvents) ? poolData.recentEvents.slice(0, 5) : [],
         },
         notes: [
-          "Current UI prototype is read-only and does not publish config changes yet.",
+          "Current UI prototype does not publish config changes yet.",
           "Source of truth remains config.spec.json -> generate -> config.json -> Git.",
-          "Next milestone is DraftConfig plus generate/validate serviceization.",
+          "DraftConfig plus generate/validate are available without mutating live config.",
         ],
       };
     } catch (error: any) {
       reply.status(500).send({
         error: "Failed to build A2G control plane payload",
         message: error?.message || "unknown error",
+      });
+    }
+  });
+
+  app.get("/api/a2g/draft", async (req: any, reply: any) => {
+    try {
+      const draftId = ((req.query as any)?.draftId as string) || "default";
+      return {
+        ok: true,
+        ...loadDraftSpec(draftId),
+      };
+    } catch (error: any) {
+      reply.status(500).send({
+        error: "Failed to load A2G draft",
+        message: error?.message || "unknown error",
+      });
+    }
+  });
+
+  app.post("/api/a2g/draft", async (req: any, reply: any) => {
+    try {
+      const draftId = req.body?.draftId || "default";
+      const spec = req.body?.spec;
+      if (!spec || typeof spec !== "object" || Array.isArray(spec)) {
+        reply.status(400).send({
+          error: "Invalid draft payload",
+          message: "spec must be a JSON object",
+        });
+        return;
+      }
+      saveDraftSpec(draftId, spec);
+      return {
+        ok: true,
+        draftId,
+        source: "draft",
+        spec,
+      };
+    } catch (error: any) {
+      reply.status(500).send({
+        error: "Failed to save A2G draft",
+        message: error?.message || "unknown error",
+      });
+    }
+  });
+
+  app.delete("/api/a2g/draft", async (req: any, reply: any) => {
+    try {
+      const draftId = req.body?.draftId || "default";
+      const draftPath = getDraftFilePath(draftId);
+      if (existsSync(draftPath)) {
+        unlinkSync(draftPath);
+      }
+      return {
+        ok: true,
+        draftId,
+      };
+    } catch (error: any) {
+      reply.status(500).send({
+        error: "Failed to reset A2G draft",
+        message: error?.message || "unknown error",
+      });
+    }
+  });
+
+  app.post("/api/a2g/generate", async (req: any, reply: any) => {
+    try {
+      const draftId = req.body?.draftId || "default";
+      const spec =
+        req.body?.spec && typeof req.body.spec === "object" && !Array.isArray(req.body.spec)
+          ? req.body.spec
+          : loadDraftSpec(draftId).spec;
+      const generatedConfig = await runA2GGenerate(spec);
+      return {
+        ok: true,
+        generatedConfig,
+        summary: summarizeGeneratedConfig(generatedConfig),
+      };
+    } catch (error: any) {
+      const formatted = formatA2GScriptError(error);
+      reply.status(formatted.statusCode).send({
+        error: "Failed to generate candidate config",
+        message: formatted.message,
+        details: formatted.details,
+      });
+    }
+  });
+
+  app.post("/api/a2g/validate", async (req: any, reply: any) => {
+    try {
+      const draftId = req.body?.draftId || "default";
+      const spec =
+        req.body?.spec && typeof req.body.spec === "object" && !Array.isArray(req.body.spec)
+          ? req.body.spec
+          : loadDraftSpec(draftId).spec;
+      const generatedConfig = await runA2GGenerate(spec);
+      const validation = await runA2GValidate(spec);
+      return {
+        ok: validation.ok,
+        inSyncWithRepoConfig: validation.ok,
+        message: validation.message,
+        generatedConfig,
+        summary: summarizeGeneratedConfig(generatedConfig),
+      };
+    } catch (error: any) {
+      const formatted = formatA2GScriptError(error);
+      reply.status(formatted.statusCode).send({
+        error: "Failed to validate candidate config",
+        message: formatted.message,
+        details: formatted.details,
       });
     }
   });

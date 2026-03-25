@@ -46,8 +46,8 @@ RUN pnpm build
 # ===========================
 FROM node:20-alpine AS production
 
-# 安装 PM2、curl 和 pm2-logrotate
-RUN apk add --no-cache curl && \
+# 安装 PM2、curl、python3 和 pm2-logrotate
+RUN apk add --no-cache curl python3 && \
     npm install -g pm2 pm2-logrotate --no-scripts && \
     pm2 install pm2-logrotate && \
     pm2 set pm2-logrotate:max_size 100M && \

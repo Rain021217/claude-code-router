@@ -1,4 +1,12 @@
-import type { A2GControlPlaneData, Config, Provider, Transformer } from '@/types';
+import type {
+  A2GControlPlaneData,
+  A2GDraftPayload,
+  A2GGeneratePayload,
+  A2GValidatePayload,
+  Config,
+  Provider,
+  Transformer,
+} from '@/types';
 
 // 日志聚合响应类型
 interface GroupedLogsResponse {
@@ -214,6 +222,26 @@ class ApiClient {
 
   async getA2GControlPlane(): Promise<A2GControlPlaneData> {
     return this.get<A2GControlPlaneData>('/a2g/control-plane');
+  }
+
+  async getA2GDraft(): Promise<A2GDraftPayload> {
+    return this.get<A2GDraftPayload>('/a2g/draft');
+  }
+
+  async saveA2GDraft(spec: Record<string, unknown>, draftId: string = 'default'): Promise<A2GDraftPayload> {
+    return this.post<A2GDraftPayload>('/a2g/draft', { draftId, spec });
+  }
+
+  async resetA2GDraft(draftId: string = 'default'): Promise<{ ok: boolean; draftId: string }> {
+    return this.delete<{ ok: boolean; draftId: string }>('/a2g/draft', { draftId });
+  }
+
+  async generateA2GConfig(spec: Record<string, unknown>, draftId: string = 'default'): Promise<A2GGeneratePayload> {
+    return this.post<A2GGeneratePayload>('/a2g/generate', { draftId, spec });
+  }
+
+  async validateA2GConfig(spec: Record<string, unknown>, draftId: string = 'default'): Promise<A2GValidatePayload> {
+    return this.post<A2GValidatePayload>('/a2g/validate', { draftId, spec });
   }
 
   // Save configuration (new endpoint)

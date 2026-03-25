@@ -107,3 +107,25 @@ export interface A2GControlPlaneData {
   };
   notes: string[];
 }
+
+export interface A2GDraftPayload {
+  ok: boolean;
+  draftId: string;
+  source: string;
+  spec: Record<string, unknown>;
+}
+
+export interface A2GGeneratePayload {
+  ok: boolean;
+  generatedConfig: Record<string, unknown>;
+  summary: {
+    providerCount: number;
+    scenarioCount: number;
+    fallbackScenarioCount: number;
+  };
+}
+
+export interface A2GValidatePayload extends A2GGeneratePayload {
+  inSyncWithRepoConfig: boolean;
+  message: string;
+}
