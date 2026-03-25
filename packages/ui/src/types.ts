@@ -117,6 +117,10 @@ export interface A2GControlPlaneData {
       message: string;
     };
   };
+  authProfileSummary?: {
+    count: number;
+    source: string;
+  };
   notes: string[];
 }
 
@@ -197,8 +201,21 @@ export interface A2GAuditEvent {
   timestamp: string;
   type: string;
   releaseVersion?: string;
+  sourceVersion?: string | null;
+  targetVersion?: string | null;
   draftRevision?: string;
   draftId?: string;
   publishedBy?: string;
   validationOk?: boolean;
+  message?: string;
+}
+
+export interface A2GAuthProfile {
+  id: string;
+  type: string;
+  displayName?: string;
+  status?: string;
+  provider?: string;
+  secretRefId?: string;
+  updatedAt?: string;
 }

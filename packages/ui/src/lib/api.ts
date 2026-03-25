@@ -1,6 +1,7 @@
 import type {
   A2GControlPlaneData,
   A2GAuditEvent,
+  A2GAuthProfile,
   A2GDiffPayload,
   A2GDraftPayload,
   A2GGeneratePayload,
@@ -290,8 +291,28 @@ class ApiClient {
     });
   }
 
-  async getA2GAudit(limit: number = 50): Promise<{ ok: boolean; events: A2GAuditEvent[] }> {
-    return this.get<{ ok: boolean; events: A2GAuditEvent[] }>(`/a2g/audit?limit=${limit}`);
+  async getA2GAudit(
+    limit: number = 50,
+    filters?: {
+      type?: string;
+      releaseVersion?: string;
+      since?: string;
+      until?: string;
+      draftId?: string;
+    },
+  ): Promise<{ ok: boolean; events: A2GAuditEvent[] }> {
+    const params = new URLSearchParams();
+    params.set('limit', String(limit));
+    if (filters?.type) params.set('type', filters.type);
+    if (filters?.releaseVersion) params.set('releaseVersion', filters.releaseVersion);
+    if (filters?.since) params.set('since', filters.since);
+    if (filters?.until) params.set('until', filters.until);
+    if (filters?.draftId) params.set('draftId', filters.draftId);
+    return this.get<{ ok: boolean; events: A2GAuditEvent[] }>(`/a2g/audit?${params.toString()}`);
+  }
+
+  async getA2GAuthProfiles(): Promise<{ ok: boolean; source: string; count: number; profiles: A2GAuthProfile[] }> {
+    return this.get<{ ok: boolean; source: string; count: number; profiles: A2GAuthProfile[] }>('/a2g/auth-profiles');
   }
 
   // Save configuration (new endpoint)

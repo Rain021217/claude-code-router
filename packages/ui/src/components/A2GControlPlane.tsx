@@ -8,10 +8,19 @@ import type {
   A2GDiffPayload,
   A2GGeneratePayload,
   A2GReleaseContextPayload,
+  A2GAuthProfile,
   A2GValidatePayload,
 } from "@/types";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
+import { Input } from "@/components/ui/input";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import {
   Card,
   CardContent,
@@ -45,8 +54,16 @@ export function A2GControlPlane() {
   const [auditEvents, setAuditEvents] = useState<
     A2GReleaseContextPayload["auditEvents"]
   >([]);
+  const [authProfiles, setAuthProfiles] = useState<A2GAuthProfile[]>([]);
+  const [auditTypeFilter, setAuditTypeFilter] = useState("all");
+  const [auditReleaseFilter, setAuditReleaseFilter] = useState("");
+  const [auditSinceFilter, setAuditSinceFilter] = useState("");
+  const [auditUntilFilter, setAuditUntilFilter] = useState("");
   const [actionError, setActionError] = useState<string | null>(null);
   const [busyAction, setBusyAction] = useState<string | null>(null);
+
+  const toIsoOrUndefined = (value: string) =>
+    value.trim() ? new Date(value).toISOString() : undefined;
 
   const parseDraft = () => {
     try {
@@ -64,16 +81,18 @@ export function A2GControlPlane() {
     }
     setError(null);
     try {
-      const [payload, draft, release] = await Promise.all([
+      const [payload, draft, release, authProfilesPayload] = await Promise.all([
         api.getA2GControlPlane(),
         api.getA2GDraft(),
         api.getA2GReleaseContext(),
+        api.getA2GAuthProfiles(),
       ]);
       setData(payload);
       setDraftText(JSON.stringify(draft.spec, null, 2));
       setDraftSource(draft.source);
       setReleaseContext(release);
       setAuditEvents(release.auditEvents ?? []);
+      setAuthProfiles(authProfilesPayload.profiles ?? []);
     } catch (err) {
       setError((err as Error).message);
     } finally {
@@ -191,6 +210,33 @@ export function A2GControlPlane() {
       setDiffPreview(null);
       await load(true);
       setDraftMessage(t("a2gControlPlane.draftReset"));
+    });
+
+  const loadAudit = async () => {
+    const audit = await api.getA2GAudit(20, {
+      type: auditTypeFilter === "all" ? undefined : auditTypeFilter,
+      releaseVersion: auditReleaseFilter.trim() || undefined,
+      since: toIsoOrUndefined(auditSinceFilter),
+      until: toIsoOrUndefined(auditUntilFilter),
+    });
+    setAuditEvents(audit.events);
+  };
+
+  const handleApplyAuditFilters = () =>
+    runAction("audit-filter", async () => {
+      await loadAudit();
+      setDraftMessage(t("a2gControlPlane.auditFiltersApplied"));
+    });
+
+  const handleResetAuditFilters = () =>
+    runAction("audit-filter-reset", async () => {
+      setAuditTypeFilter("all");
+      setAuditReleaseFilter("");
+      setAuditSinceFilter("");
+      setAuditUntilFilter("");
+      const audit = await api.getA2GAudit(20);
+      setAuditEvents(audit.events);
+      setDraftMessage(t("a2gControlPlane.auditFiltersReset"));
     });
 
   return (
@@ -327,6 +373,14 @@ export function A2GControlPlane() {
                   </div>
                   <div className="mt-1 text-xl font-semibold">
                     {data.poolSummary.activeScenarios}
+                  </div>
+                </div>
+                <div className="rounded-md border bg-muted/30 p-3">
+                  <div className="text-xs text-muted-foreground">
+                    {t("a2gControlPlane.authProfileCount")}
+                  </div>
+                  <div className="mt-1 text-xl font-semibold">
+                    {data.authProfileSummary?.count ?? 0}
                   </div>
                 </div>
               </CardContent>
@@ -556,6 +610,52 @@ export function A2GControlPlane() {
                   <div className="font-medium">
                     {t("a2gControlPlane.auditTitle")}
                   </div>
+                  <div className="grid gap-2 rounded-md border bg-muted/30 p-3 md:grid-cols-2 xl:grid-cols-[180px_1fr_1fr_1fr_auto_auto]">
+                    <Select value={auditTypeFilter} onValueChange={setAuditTypeFilter}>
+                      <SelectTrigger>
+                        <SelectValue placeholder={t("a2gControlPlane.auditFilterAction")} />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="all">{t("a2gControlPlane.auditTypeAll")}</SelectItem>
+                        <SelectItem value="draft_saved">{t("a2gControlPlane.auditTypeDraftSaved")}</SelectItem>
+                        <SelectItem value="validate_failed">{t("a2gControlPlane.auditTypeValidateFailed")}</SelectItem>
+                        <SelectItem value="snapshot_created">{t("a2gControlPlane.auditTypeSnapshotCreated")}</SelectItem>
+                        <SelectItem value="publish">{t("a2gControlPlane.auditTypePublish")}</SelectItem>
+                        <SelectItem value="rollback">{t("a2gControlPlane.auditTypeRollback")}</SelectItem>
+                      </SelectContent>
+                    </Select>
+                    <Input
+                      value={auditReleaseFilter}
+                      onChange={(event) => setAuditReleaseFilter(event.target.value)}
+                      placeholder={t("a2gControlPlane.auditFilterVersion")}
+                    />
+                    <Input
+                      type="datetime-local"
+                      value={auditSinceFilter}
+                      onChange={(event) => setAuditSinceFilter(event.target.value)}
+                      placeholder={t("a2gControlPlane.auditFilterSince")}
+                    />
+                    <Input
+                      type="datetime-local"
+                      value={auditUntilFilter}
+                      onChange={(event) => setAuditUntilFilter(event.target.value)}
+                      placeholder={t("a2gControlPlane.auditFilterUntil")}
+                    />
+                    <Button
+                      variant="outline"
+                      onClick={handleApplyAuditFilters}
+                      disabled={busyAction !== null}
+                    >
+                      {t("a2gControlPlane.applyAuditFilters")}
+                    </Button>
+                    <Button
+                      variant="ghost"
+                      onClick={handleResetAuditFilters}
+                      disabled={busyAction !== null}
+                    >
+                      {t("a2gControlPlane.resetAuditFilters")}
+                    </Button>
+                  </div>
                   <div className="space-y-2">
                     {auditEvents.slice(0, 5).map((event) => (
                       <div
@@ -569,10 +669,21 @@ export function A2GControlPlane() {
                           </div>
                         </div>
                         <div className="mt-1 text-xs text-muted-foreground">
-                          {[event.releaseVersion, event.publishedBy]
+                          {[
+                            event.releaseVersion,
+                            event.sourceVersion && event.targetVersion
+                              ? `${event.sourceVersion} -> ${event.targetVersion}`
+                              : null,
+                            event.publishedBy,
+                          ]
                             .filter(Boolean)
                             .join(" · ")}
                         </div>
+                        {event.message && (
+                          <div className="mt-1 text-xs text-muted-foreground">
+                            {event.message}
+                          </div>
+                        )}
                       </div>
                     ))}
                     {auditEvents.length === 0 && (
@@ -582,6 +693,44 @@ export function A2GControlPlane() {
                     )}
                   </div>
                 </div>
+              </CardContent>
+            </Card>
+
+            <Card>
+              <CardHeader>
+                <CardTitle className="text-lg">
+                  {t("a2gControlPlane.authProfilesTitle")}
+                </CardTitle>
+                <CardDescription>
+                  {t("a2gControlPlane.authProfilesDescription")}
+                </CardDescription>
+              </CardHeader>
+              <CardContent className="space-y-2">
+                {authProfiles.slice(0, 5).map((profile) => (
+                  <div
+                    key={profile.id}
+                    className="flex items-center justify-between gap-3 rounded-md border p-3 text-sm"
+                  >
+                    <div className="min-w-0">
+                      <div className="font-medium">
+                        {profile.displayName || profile.id}
+                      </div>
+                      <div className="truncate text-xs text-muted-foreground">
+                        {[profile.provider, profile.type, profile.secretRefId]
+                          .filter(Boolean)
+                          .join(" · ")}
+                      </div>
+                    </div>
+                    <Badge variant={profile.status === "active" ? "default" : "secondary"}>
+                      {profile.status || "draft"}
+                    </Badge>
+                  </div>
+                ))}
+                {authProfiles.length === 0 && (
+                  <div className="text-sm text-muted-foreground">
+                    {t("a2gControlPlane.noAuthProfiles")}
+                  </div>
+                )}
               </CardContent>
             </Card>
 

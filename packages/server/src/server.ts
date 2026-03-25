@@ -52,6 +52,9 @@ export const createServer = async (config: any): Promise<any> => {
       controlPlaneStateDir:
         process.env.A2G_CONTROL_PLANE_STATE_DIR ||
         join(HOME_DIR, "state", "a2g-control-plane"),
+      authStateDir:
+        process.env.A2G_AUTH_STATE_DIR ||
+        join(HOME_DIR, "state", "a2g-auth"),
       tmpDir: join(homeA2GDir, "tmp"),
     };
   };
@@ -100,6 +103,12 @@ export const createServer = async (config: any): Promise<any> => {
     return join(controlPlaneStateDir, "audit.v1.jsonl");
   };
 
+  const getAuthProfilesPath = () => {
+    const { authStateDir } = getA2GPaths();
+    ensureA2GDir(authStateDir);
+    return join(authStateDir, "auth-profiles.v1.json");
+  };
+
   const loadDraftSpec = (draftId = "default") => {
     const draftPath = getDraftFilePath(draftId);
     const { specPath } = getA2GPaths();
@@ -116,6 +125,16 @@ export const createServer = async (config: any): Promise<any> => {
     const draftPath = getDraftFilePath(draftId);
     writeFileSync(draftPath, `${JSON.stringify(spec, null, 2)}\n`, "utf-8");
     return draftPath;
+  };
+
+  const loadAuthProfilesStore = () => {
+    const authProfilesPath = getAuthProfilesPath();
+    if (!existsSync(authProfilesPath)) {
+      return {
+        profiles: [] as Array<Record<string, unknown>>,
+      };
+    }
+    return readJsonFile(authProfilesPath);
   };
 
   const stableSerialize = (value: unknown): string => {
@@ -296,7 +315,21 @@ export const createServer = async (config: any): Promise<any> => {
     return record;
   };
 
-  const readAuditEvents = (limit = 50) => {
+  const readAuditEvents = ({
+    limit = 50,
+    type,
+    releaseVersion,
+    since,
+    until,
+    draftId,
+  }: {
+    limit?: number;
+    type?: string;
+    releaseVersion?: string;
+    since?: string;
+    until?: string;
+    draftId?: string;
+  } = {}) => {
     const auditPath = getAuditLogPath();
     if (!existsSync(auditPath)) {
       return [];
@@ -305,10 +338,33 @@ export const createServer = async (config: any): Promise<any> => {
       .split("\n")
       .map((line) => line.trim())
       .filter(Boolean);
-    return lines
-      .slice(-limit)
-      .reverse()
-      .map((line) => JSON.parse(line));
+    const events = lines
+      .map((line) => JSON.parse(line))
+      .filter((event) => {
+        if (type && event.type !== type) {
+          return false;
+        }
+        if (
+          releaseVersion &&
+          event.releaseVersion !== releaseVersion &&
+          event.targetVersion !== releaseVersion &&
+          event.sourceVersion !== releaseVersion
+        ) {
+          return false;
+        }
+        if (draftId && event.draftId !== draftId) {
+          return false;
+        }
+        if (since && event.timestamp < since) {
+          return false;
+        }
+        if (until && event.timestamp > until) {
+          return false;
+        }
+        return true;
+      });
+
+    return events.slice(-limit).reverse();
   };
 
   const updateMetadataSnapshots = (
@@ -356,7 +412,7 @@ export const createServer = async (config: any): Promise<any> => {
       validation,
       specDiff,
       generatedDiff,
-      auditEvents: readAuditEvents(20),
+      auditEvents: readAuditEvents({ limit: 20 }),
       snapshots: Array.isArray(metadata.snapshots) ? metadata.snapshots.slice(0, 10) : [],
     };
   };
@@ -643,6 +699,10 @@ export const createServer = async (config: any): Promise<any> => {
         : [];
 
       const releaseContext = await getReleaseContext("default");
+      const authProfilesStore = loadAuthProfilesStore();
+      const authProfiles = Array.isArray(authProfilesStore.profiles)
+        ? authProfilesStore.profiles
+        : [];
 
       return {
         status: "ok",
@@ -684,6 +744,10 @@ export const createServer = async (config: any): Promise<any> => {
             ? releaseContext.auditEvents.length
             : 0,
           validation: releaseContext.validation,
+        },
+        authProfileSummary: {
+          count: authProfiles.length,
+          source: "file_auth_profile_store_preview",
         },
         notes: [
           "Control plane supports draft editing, generate/validate, publish, rollback, and audit preview.",
@@ -727,6 +791,11 @@ export const createServer = async (config: any): Promise<any> => {
         return;
       }
       saveDraftSpec(draftId, spec);
+      appendAuditEvent({
+        type: "draft_saved",
+        draftId,
+        draftRevision: computeRevision(spec),
+      });
       return {
         ok: true,
         draftId,
@@ -792,6 +861,15 @@ export const createServer = async (config: any): Promise<any> => {
           : loadDraftSpec(draftId).spec;
       const generatedConfig = await runA2GGenerate(spec);
       const validation = await runA2GValidate(spec, generatedConfig);
+      if (!validation.ok) {
+        appendAuditEvent({
+          type: "validate_failed",
+          draftId,
+          draftRevision: computeRevision(spec),
+          validationOk: false,
+          message: validation.message,
+        });
+      }
       return {
         ok: validation.ok,
         inSyncWithRepoConfig: validation.inSyncWithRepoConfig,
@@ -912,6 +990,7 @@ export const createServer = async (config: any): Promise<any> => {
     const publishedBy = req.body?.publishedBy || "ui-publish";
     const metadataBefore = loadControlPlaneMetadata();
     const currentConfig = await readConfigFile();
+    const previousActiveVersion = metadataBefore.activeVersion || null;
     try {
       const draft =
         req.body?.spec && typeof req.body.spec === "object" && !Array.isArray(req.body.spec)
@@ -979,6 +1058,8 @@ export const createServer = async (config: any): Promise<any> => {
           type: "publish",
           draftId,
           releaseVersion,
+          sourceVersion: previousActiveVersion,
+          targetVersion: releaseVersion,
           draftRevision: snapshot.draftRevision,
           publishedBy,
         });
@@ -1015,6 +1096,7 @@ export const createServer = async (config: any): Promise<any> => {
 
     const metadataBefore = loadControlPlaneMetadata();
     const currentConfig = await readConfigFile();
+    const previousActiveVersion = metadataBefore.activeVersion || null;
     try {
       const snapshot = loadSnapshot(releaseVersion);
       await backupConfigFile();
@@ -1036,6 +1118,8 @@ export const createServer = async (config: any): Promise<any> => {
         appendAuditEvent({
           type: "rollback",
           releaseVersion,
+          sourceVersion: previousActiveVersion,
+          targetVersion: releaseVersion,
           publishedBy,
         });
       } catch (error) {
@@ -1059,13 +1143,46 @@ export const createServer = async (config: any): Promise<any> => {
   app.get("/api/a2g/audit", async (req: any, reply: any) => {
     try {
       const limit = Number((req.query as any)?.limit || 50);
+      const type = (req.query as any)?.type;
+      const releaseVersion = (req.query as any)?.releaseVersion;
+      const since = (req.query as any)?.since;
+      const until = (req.query as any)?.until;
+      const draftId = (req.query as any)?.draftId;
       return {
         ok: true,
-        events: readAuditEvents(Number.isFinite(limit) ? limit : 50),
+        events: readAuditEvents({
+          limit: Number.isFinite(limit) ? limit : 50,
+          type: typeof type === "string" && type ? type : undefined,
+          releaseVersion:
+            typeof releaseVersion === "string" && releaseVersion
+              ? releaseVersion
+              : undefined,
+          since: typeof since === "string" && since ? since : undefined,
+          until: typeof until === "string" && until ? until : undefined,
+          draftId: typeof draftId === "string" && draftId ? draftId : undefined,
+        }),
       };
     } catch (error: any) {
       reply.status(500).send({
         error: "Failed to load audit events",
+        message: error?.message || "unknown error",
+      });
+    }
+  });
+
+  app.get("/api/a2g/auth-profiles", async (_req: any, reply: any) => {
+    try {
+      const store = loadAuthProfilesStore();
+      const profiles = Array.isArray(store.profiles) ? store.profiles : [];
+      return {
+        ok: true,
+        source: "file_auth_profile_store_preview",
+        count: profiles.length,
+        profiles,
+      };
+    } catch (error: any) {
+      reply.status(500).send({
+        error: "Failed to load auth profiles",
         message: error?.message || "unknown error",
       });
     }
