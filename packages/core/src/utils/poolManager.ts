@@ -1,5 +1,4 @@
-import { mkdir, readFile, rename, writeFile } from "fs/promises";
-import { dirname } from "path";
+import { FilePoolStateStore, PoolStateStore } from "./poolStateStore";
 
 type CooldownReason =
   | "http_429"
@@ -105,6 +104,13 @@ interface PoolManagerPersistedState {
   }>;
 }
 
+interface PoolHealthOverview {
+  coolingByReason: Record<string, number>;
+  recentEventCounts: Record<string, number>;
+  activeScenarios: number;
+  lastEventAt: number | null;
+}
+
 export class PoolManager {
   private readonly providerStates = new Map<string, ProviderCooldownState>();
   private readonly scenarioCursors = new Map<string, number>();
@@ -144,6 +150,7 @@ export class PoolManager {
     timestamp: number;
     details?: string;
   }> = [];
+  private readonly stateStores = new Map<string, PoolStateStore<PoolManagerPersistedState>>();
   private hasHydrated = false;
   private persistTimer: ReturnType<typeof setTimeout> | null = null;
   private persistInFlight: Promise<void> = Promise.resolve();
@@ -180,6 +187,22 @@ export class PoolManager {
       return null;
     }
     return config.stateFile;
+  }
+
+  private getStateStore(
+    rawConfig?: PoolManagerConfig
+  ): PoolStateStore<PoolManagerPersistedState> | null {
+    const stateFile = this.getStateFile(rawConfig);
+    if (!stateFile) {
+      return null;
+    }
+    const existing = this.stateStores.get(stateFile);
+    if (existing) {
+      return existing;
+    }
+    const store = new FilePoolStateStore<PoolManagerPersistedState>(stateFile);
+    this.stateStores.set(stateFile, store);
+    return store;
   }
 
   private cleanupExpired(rawConfig?: PoolManagerConfig, now = Date.now()) {
@@ -301,17 +324,21 @@ export class PoolManager {
       return;
     }
     this.hasHydrated = true;
-    const stateFile = this.getStateFile(rawConfig);
-    if (!stateFile) {
+    const stateStore = this.getStateStore(rawConfig);
+    if (!stateStore) {
       return;
     }
     try {
-      const raw = await readFile(stateFile, "utf8");
-      const parsed = JSON.parse(raw) as PoolManagerPersistedState;
+      const parsed = await stateStore.load(logger);
+      if (!parsed) {
+        return;
+      }
       this.importState(parsed, rawConfig);
+      const store = stateStore.describe();
       logger?.info?.(
         {
-          stateFile,
+          stateStore: store.kind,
+          stateTarget: store.target,
           coolingProviders: this.providerStates.size,
           providersWithRecentFailures: this.failureCounters.size,
           scenarioCursorCount: this.scenarioCursors.size,
@@ -319,49 +346,43 @@ export class PoolManager {
         "[PoolManager] hydrated persisted state"
       );
     } catch (error: any) {
-      if (error?.code === "ENOENT") {
-        logger?.info?.({ stateFile }, "[PoolManager] state file does not exist yet");
-        return;
-      }
+      const store = stateStore.describe();
       logger?.warn?.(
         {
-          stateFile,
+          stateStore: store.kind,
+          stateTarget: store.target,
           message: error?.message,
         },
-        "[PoolManager] failed to hydrate state file"
+        "[PoolManager] failed to hydrate state store"
       );
     }
   }
 
   private queuePersist(
-    stateFile: string,
+    stateStore: PoolStateStore<PoolManagerPersistedState>,
     payload: PoolManagerPersistedState,
     logger?: any
   ) {
     this.persistInFlight = this.persistInFlight
       .then(async () => {
-        const dir = dirname(stateFile);
-        const tmpFile = `${stateFile}.tmp`;
-        await mkdir(dir, { recursive: true });
-        await writeFile(
-          tmpFile,
-          JSON.stringify(payload, null, 2) + "\n",
-          "utf8"
-        );
-        await rename(tmpFile, stateFile);
+        await stateStore.save(payload, logger);
+        const store = stateStore.describe();
         logger?.debug?.(
           {
-            stateFile,
+            stateStore: store.kind,
+            stateTarget: store.target,
             coolingProviders: payload.providerStates.length,
             providersWithRecentFailures: payload.failureCounters.length,
           },
-          "[PoolManager] persisted state to disk"
+          "[PoolManager] persisted state"
         );
       })
       .catch((error: any) => {
+        const store = stateStore.describe();
         logger?.warn?.(
           {
-            stateFile,
+            stateStore: store.kind,
+            stateTarget: store.target,
             message: error?.message,
           },
           "[PoolManager] failed to persist state"
@@ -386,8 +407,8 @@ export class PoolManager {
   }
 
   async flushNow(rawConfig?: PoolManagerConfig, logger?: any) {
-    const stateFile = this.getStateFile(rawConfig);
-    if (!stateFile) {
+    const stateStore = this.getStateStore(rawConfig);
+    if (!stateStore) {
       return;
     }
     if (this.persistTimer) {
@@ -395,7 +416,7 @@ export class PoolManager {
       this.persistTimer = null;
     }
     const payload = this.exportState(rawConfig);
-    await this.queuePersist(stateFile, payload, logger);
+    await this.queuePersist(stateStore, payload, logger);
   }
 
   private parseProviderName(route?: string | null): string | null {
@@ -924,10 +945,33 @@ export class PoolManager {
         count: selection.count,
       })
     );
+    const coolingByReason = pool.reduce<Record<string, number>>((acc, state) => {
+      acc[state.reason] = (acc[state.reason] || 0) + 1;
+      return acc;
+    }, {});
+    const recentEventCounts = this.recentEvents.reduce<Record<string, number>>(
+      (acc, event) => {
+        acc[event.type] = (acc[event.type] || 0) + 1;
+        return acc;
+      },
+      {}
+    );
+    const overview: PoolHealthOverview = {
+      coolingByReason,
+      recentEventCounts,
+      activeScenarios: scenarioSelections.length,
+      lastEventAt:
+        this.recentEvents.length > 0
+          ? this.recentEvents[this.recentEvents.length - 1].timestamp
+          : null,
+    };
     return {
       coolingProviders: pool.length,
+      coolingRoutes: pool.length,
       providersWithRecentFailures: failures.length,
+      routesWithRecentFailures: failures.length,
       stats: { ...this.stats },
+      overview,
       scenarioCursors,
       scenarioSelections,
       recentEvents: [...this.recentEvents],
