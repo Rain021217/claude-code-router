@@ -111,6 +111,7 @@ export interface A2GControlPlaneData {
     latestSnapshotVersion: string | null;
     hasUnpublishedChanges: boolean;
     snapshotCount: number;
+    auditCount: number;
     validation: {
       ok: boolean;
       message: string;
@@ -187,5 +188,17 @@ export interface A2GReleaseContextPayload {
   };
   specDiff: A2GDiffPayload["specDiff"];
   generatedDiff: A2GDiffPayload["generatedDiff"];
+  auditEvents: A2GAuditEvent[];
   snapshots: A2GSnapshotMeta[];
+}
+
+export interface A2GAuditEvent {
+  id: string;
+  timestamp: string;
+  type: string;
+  releaseVersion?: string;
+  draftRevision?: string;
+  draftId?: string;
+  publishedBy?: string;
+  validationOk?: boolean;
 }

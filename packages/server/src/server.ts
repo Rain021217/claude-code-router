@@ -94,6 +94,12 @@ export const createServer = async (config: any): Promise<any> => {
     return snapshotsDir;
   };
 
+  const getAuditLogPath = () => {
+    const { controlPlaneStateDir } = getA2GPaths();
+    ensureA2GDir(controlPlaneStateDir);
+    return join(controlPlaneStateDir, "audit.v1.jsonl");
+  };
+
   const loadDraftSpec = (draftId = "default") => {
     const draftPath = getDraftFilePath(draftId);
     const { specPath } = getA2GPaths();
@@ -258,11 +264,67 @@ export const createServer = async (config: any): Promise<any> => {
     return snapshot;
   };
 
+  const loadSnapshot = (releaseVersion: string) => {
+    const snapshotPath = join(getSnapshotDir(), `${releaseVersion}.json`);
+    if (!existsSync(snapshotPath)) {
+      throw new Error(`snapshot not found: ${releaseVersion}`);
+    }
+    return readJsonFile(snapshotPath);
+  };
+
+  const updateSnapshot = (snapshot: Record<string, unknown>) => {
+    const releaseVersion = snapshot.releaseVersion as string;
+    const snapshotPath = join(getSnapshotDir(), `${releaseVersion}.json`);
+    writeFileSync(snapshotPath, `${JSON.stringify(snapshot, null, 2)}\n`, "utf-8");
+    return snapshot;
+  };
+
+  const appendAuditEvent = (event: Record<string, unknown>) => {
+    const auditPath = getAuditLogPath();
+    const record = {
+      id: createHash("sha256")
+        .update(`${Date.now()}-${Math.random()}-${JSON.stringify(event)}`)
+        .digest("hex")
+        .slice(0, 12),
+      timestamp: new Date().toISOString(),
+      ...event,
+    };
+    writeFileSync(auditPath, `${JSON.stringify(record)}\n`, {
+      encoding: "utf-8",
+      flag: "a",
+    });
+    return record;
+  };
+
+  const readAuditEvents = (limit = 50) => {
+    const auditPath = getAuditLogPath();
+    if (!existsSync(auditPath)) {
+      return [];
+    }
+    const lines = readFileSync(auditPath, "utf-8")
+      .split("\n")
+      .map((line) => line.trim())
+      .filter(Boolean);
+    return lines
+      .slice(-limit)
+      .reverse()
+      .map((line) => JSON.parse(line));
+  };
+
+  const updateMetadataSnapshots = (
+    metadata: any,
+    updater: (snapshot: any) => any,
+  ) => {
+    const snapshots = Array.isArray(metadata.snapshots) ? metadata.snapshots : [];
+    metadata.snapshots = snapshots.map((snapshot: any) => updater({ ...snapshot }));
+    return metadata;
+  };
+
   const getReleaseContext = async (draftId = "default") => {
     const metadata = loadControlPlaneMetadata();
     const draft = loadDraftSpec(draftId);
     const generatedConfig = await runA2GGenerate(draft.spec);
-    const validation = await runA2GValidate(draft.spec);
+    const validation = await runA2GValidate(draft.spec, generatedConfig);
     const draftRevision = computeRevision(draft.spec);
     const currentConfig = await readConfigFile();
     const specPath = getA2GPaths().specPath;
@@ -294,6 +356,7 @@ export const createServer = async (config: any): Promise<any> => {
       validation,
       specDiff,
       generatedDiff,
+      auditEvents: readAuditEvents(20),
       snapshots: Array.isArray(metadata.snapshots) ? metadata.snapshots.slice(0, 10) : [],
     };
   };
@@ -381,8 +444,11 @@ export const createServer = async (config: any): Promise<any> => {
     }
   };
 
-  const runA2GValidate = async (spec: Record<string, unknown>) => {
-    const { validatorPath, generatedConfigPath, tmpDir } = getA2GPaths();
+  const runA2GValidate = async (
+    spec: Record<string, unknown>,
+    generatedConfigOverride?: Record<string, unknown>,
+  ) => {
+    const { validatorPath, tmpDir } = getA2GPaths();
     if (!validatorPath || !existsSync(validatorPath)) {
       throw new Error("A2G validator script is not available");
     }
@@ -393,21 +459,36 @@ export const createServer = async (config: any): Promise<any> => {
     );
     ensureA2GDir(runDir);
     const specFile = join(runDir, "draft.spec.json");
+    const generatedConfigFile = join(runDir, "generated.config.json");
+    const generatedConfig =
+      generatedConfigOverride || (await runA2GGenerate(spec));
     try {
       writeFileSync(specFile, `${JSON.stringify(spec, null, 2)}\n`, "utf-8");
+      writeFileSync(
+        generatedConfigFile,
+        `${JSON.stringify(generatedConfig, null, 2)}\n`,
+        "utf-8",
+      );
       await runA2GScript(validatorPath, [
         "--spec",
         specFile,
         "--config",
-        generatedConfigPath,
+        generatedConfigFile,
       ]);
+      const currentConfig = await readConfigFile();
+      const inSyncWithRepoConfig =
+        stableSerialize(currentConfig) === stableSerialize(generatedConfig);
       return {
         ok: true,
-        message: "router config is in sync",
+        inSyncWithRepoConfig,
+        message: inSyncWithRepoConfig
+          ? "router config is in sync"
+          : "candidate config is valid but differs from current runtime config",
       };
     } catch (error: any) {
       return {
         ok: false,
+        inSyncWithRepoConfig: false,
         message:
           error?.stderr || error?.stdout || error?.message || "validation failed",
       };
@@ -599,13 +680,16 @@ export const createServer = async (config: any): Promise<any> => {
           snapshotCount: Array.isArray(releaseContext.snapshots)
             ? releaseContext.snapshots.length
             : 0,
+          auditCount: Array.isArray(releaseContext.auditEvents)
+            ? releaseContext.auditEvents.length
+            : 0,
           validation: releaseContext.validation,
         },
         notes: [
-          "Current UI prototype does not publish config changes yet.",
+          "Control plane supports draft editing, generate/validate, publish, rollback, and audit preview.",
           "Source of truth remains config.spec.json -> generate -> config.json -> Git.",
-          "DraftConfig plus generate/validate are available without mutating live config.",
-          "Snapshot and diff preview are available before publish/rollback are implemented.",
+          "UI publish writes the generated config and records release metadata plus audit events.",
+          "Current prototype still stops short of full release governance such as approvals and rollback policies.",
         ],
       };
     } catch (error: any) {
@@ -707,10 +791,10 @@ export const createServer = async (config: any): Promise<any> => {
           ? req.body.spec
           : loadDraftSpec(draftId).spec;
       const generatedConfig = await runA2GGenerate(spec);
-      const validation = await runA2GValidate(spec);
+      const validation = await runA2GValidate(spec, generatedConfig);
       return {
         ok: validation.ok,
-        inSyncWithRepoConfig: validation.ok,
+        inSyncWithRepoConfig: validation.inSyncWithRepoConfig,
         message: validation.message,
         generatedConfig,
         summary: summarizeGeneratedConfig(generatedConfig),
@@ -769,7 +853,7 @@ export const createServer = async (config: any): Promise<any> => {
           ? { spec: req.body.spec as Record<string, unknown>, source: "request" }
           : loadDraftSpec(draftId);
       const generatedConfig = await runA2GGenerate(draft.spec);
-      const validation = await runA2GValidate(draft.spec);
+      const validation = await runA2GValidate(draft.spec, generatedConfig);
       const releaseVersion = createSnapshotVersion(computeRevision(draft.spec));
       const snapshot = saveSnapshot({
         releaseVersion,
@@ -801,6 +885,13 @@ export const createServer = async (config: any): Promise<any> => {
         metadata.activeVersion = null;
       }
       saveControlPlaneMetadata(metadata);
+      appendAuditEvent({
+        type: "snapshot_created",
+        releaseVersion: snapshot.releaseVersion,
+        draftRevision: snapshot.draftRevision,
+        publishedBy,
+        validationOk: snapshot.validation.ok,
+      });
 
       return {
         ok: true,
@@ -812,6 +903,170 @@ export const createServer = async (config: any): Promise<any> => {
         error: "Failed to create snapshot",
         message: formatted.message,
         details: formatted.details,
+      });
+    }
+  });
+
+  app.post("/api/a2g/publish", async (req: any, reply: any) => {
+    const draftId = req.body?.draftId || "default";
+    const publishedBy = req.body?.publishedBy || "ui-publish";
+    const metadataBefore = loadControlPlaneMetadata();
+    const currentConfig = await readConfigFile();
+    try {
+      const draft =
+        req.body?.spec && typeof req.body.spec === "object" && !Array.isArray(req.body.spec)
+          ? { spec: req.body.spec as Record<string, unknown>, source: "request" }
+          : loadDraftSpec(draftId);
+      const generatedConfig = await runA2GGenerate(draft.spec);
+      const validation = await runA2GValidate(draft.spec, generatedConfig);
+      if (!validation.ok) {
+        reply.status(400).send({
+          error: "Publish blocked by validation",
+          message: validation.message,
+        });
+        return;
+      }
+
+      const releaseVersion = createSnapshotVersion(computeRevision(draft.spec));
+      const snapshot = saveSnapshot({
+        releaseVersion,
+        spec: draft.spec,
+        generatedConfig,
+        validation,
+        publishedBy,
+      });
+
+      await backupConfigFile();
+      try {
+        await writeConfigFile(generatedConfig);
+        const metadata = loadControlPlaneMetadata();
+        updateMetadataSnapshots(metadata, (item) => ({
+          ...item,
+          active: item.releaseVersion === releaseVersion,
+          publishedAt:
+            item.releaseVersion === releaseVersion
+              ? new Date().toISOString()
+              : item.publishedAt || null,
+          publishedBy:
+            item.releaseVersion === releaseVersion
+              ? publishedBy
+              : item.publishedBy || null,
+        }));
+        const existing = Array.isArray(metadata.snapshots)
+          ? metadata.snapshots.filter((item: any) => item?.releaseVersion !== snapshot.releaseVersion)
+          : [];
+        metadata.snapshots = [
+          {
+            releaseVersion: snapshot.releaseVersion,
+            draftRevision: snapshot.draftRevision,
+            createdAt: snapshot.createdAt,
+            publishedAt: new Date().toISOString(),
+            publishedBy,
+            active: true,
+            validation: snapshot.validation,
+          },
+          ...existing.map((item: any) => ({ ...item, active: false })),
+        ];
+        metadata.activeVersion = releaseVersion;
+        saveControlPlaneMetadata(metadata);
+        updateSnapshot({
+          ...snapshot,
+          active: true,
+          publishedAt: new Date().toISOString(),
+          publishedBy,
+        });
+        appendAuditEvent({
+          type: "publish",
+          draftId,
+          releaseVersion,
+          draftRevision: snapshot.draftRevision,
+          publishedBy,
+        });
+      } catch (error) {
+        await writeConfigFile(currentConfig);
+        saveControlPlaneMetadata(metadataBefore);
+        throw error;
+      }
+
+      return {
+        ok: true,
+        activeVersion: releaseVersion,
+      };
+    } catch (error: any) {
+      const formatted = formatA2GScriptError(error);
+      reply.status(formatted.statusCode).send({
+        error: "Failed to publish draft",
+        message: formatted.message,
+        details: formatted.details,
+      });
+    }
+  });
+
+  app.post("/api/a2g/rollback", async (req: any, reply: any) => {
+    const releaseVersion = req.body?.releaseVersion;
+    const publishedBy = req.body?.publishedBy || "ui-rollback";
+    if (!releaseVersion || typeof releaseVersion !== "string") {
+      reply.status(400).send({
+        error: "Invalid rollback request",
+        message: "releaseVersion is required",
+      });
+      return;
+    }
+
+    const metadataBefore = loadControlPlaneMetadata();
+    const currentConfig = await readConfigFile();
+    try {
+      const snapshot = loadSnapshot(releaseVersion);
+      await backupConfigFile();
+      try {
+        await writeConfigFile(snapshot.generatedConfig);
+        const metadata = loadControlPlaneMetadata();
+        updateMetadataSnapshots(metadata, (item) => ({
+          ...item,
+          active: item.releaseVersion === releaseVersion,
+        }));
+        metadata.activeVersion = releaseVersion;
+        saveControlPlaneMetadata(metadata);
+        updateSnapshot({
+          ...snapshot,
+          active: true,
+          publishedAt: snapshot.publishedAt || new Date().toISOString(),
+          publishedBy,
+        });
+        appendAuditEvent({
+          type: "rollback",
+          releaseVersion,
+          publishedBy,
+        });
+      } catch (error) {
+        await writeConfigFile(currentConfig);
+        saveControlPlaneMetadata(metadataBefore);
+        throw error;
+      }
+
+      return {
+        ok: true,
+        activeVersion: releaseVersion,
+      };
+    } catch (error: any) {
+      reply.status(500).send({
+        error: "Failed to rollback snapshot",
+        message: error?.message || "unknown error",
+      });
+    }
+  });
+
+  app.get("/api/a2g/audit", async (req: any, reply: any) => {
+    try {
+      const limit = Number((req.query as any)?.limit || 50);
+      return {
+        ok: true,
+        events: readAuditEvents(Number.isFinite(limit) ? limit : 50),
+      };
+    } catch (error: any) {
+      reply.status(500).send({
+        error: "Failed to load audit events",
+        message: error?.message || "unknown error",
       });
     }
   });

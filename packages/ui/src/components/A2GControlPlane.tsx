@@ -42,6 +42,9 @@ export function A2GControlPlane() {
   const [releaseContext, setReleaseContext] =
     useState<A2GReleaseContextPayload | null>(null);
   const [diffPreview, setDiffPreview] = useState<A2GDiffPayload | null>(null);
+  const [auditEvents, setAuditEvents] = useState<
+    A2GReleaseContextPayload["auditEvents"]
+  >([]);
   const [actionError, setActionError] = useState<string | null>(null);
   const [busyAction, setBusyAction] = useState<string | null>(null);
 
@@ -70,6 +73,7 @@ export function A2GControlPlane() {
       setDraftText(JSON.stringify(draft.spec, null, 2));
       setDraftSource(draft.source);
       setReleaseContext(release);
+      setAuditEvents(release.auditEvents ?? []);
     } catch (err) {
       setError((err as Error).message);
     } finally {
@@ -123,6 +127,7 @@ export function A2GControlPlane() {
         summary: result.summary,
       });
       setReleaseContext(release);
+      setAuditEvents(release.auditEvents ?? []);
       setDraftMessage(result.message);
     });
 
@@ -143,7 +148,39 @@ export function A2GControlPlane() {
       await api.createA2GSnapshot(spec);
       const release = await api.getA2GReleaseContext();
       setReleaseContext(release);
+      setAuditEvents(release.auditEvents ?? []);
       setDraftMessage(t("a2gControlPlane.snapshotCreated"));
+    });
+
+  const handlePublishDraft = () =>
+    runAction("publish", async () => {
+      const spec = parseDraft();
+      await api.publishA2GDraft(spec);
+      const [payload, release, audit] = await Promise.all([
+        api.getA2GControlPlane(),
+        api.getA2GReleaseContext(),
+        api.getA2GAudit(20),
+      ]);
+      setData(payload);
+      setReleaseContext(release);
+      setAuditEvents(audit.events);
+      setDraftMessage(t("a2gControlPlane.publishSuccess"));
+    });
+
+  const handleRollback = (releaseVersion: string) =>
+    runAction("rollback", async () => {
+      await api.rollbackA2GSnapshot(releaseVersion);
+      const [payload, release, audit] = await Promise.all([
+        api.getA2GControlPlane(),
+        api.getA2GReleaseContext(),
+        api.getA2GAudit(20),
+      ]);
+      setData(payload);
+      setReleaseContext(release);
+      setAuditEvents(audit.events);
+      setDraftMessage(
+        t("a2gControlPlane.rollbackSuccess", { releaseVersion }),
+      );
     });
 
   const handleResetDraft = () =>
@@ -334,6 +371,13 @@ export function A2GControlPlane() {
                   </Button>
                   <Button
                     variant="outline"
+                    onClick={handlePublishDraft}
+                    disabled={busyAction !== null}
+                  >
+                    {t("a2gControlPlane.publishDraft")}
+                  </Button>
+                  <Button
+                    variant="outline"
                     onClick={handleCreateSnapshot}
                     disabled={busyAction !== null}
                   >
@@ -452,6 +496,14 @@ export function A2GControlPlane() {
                   </div>
                   <div className="rounded-md border p-3">
                     <div className="text-xs text-muted-foreground">
+                      {t("a2gControlPlane.auditCount")}
+                    </div>
+                    <div className="mt-1 font-semibold">
+                      {releaseContext?.auditEvents.length ?? data.releaseSummary.auditCount}
+                    </div>
+                  </div>
+                  <div className="rounded-md border p-3">
+                    <div className="text-xs text-muted-foreground">
                       {t("a2gControlPlane.snapshotCount")}
                     </div>
                     <div className="mt-1 font-semibold">
@@ -478,14 +530,54 @@ export function A2GControlPlane() {
                             {snapshot.createdAt}
                           </div>
                         </div>
-                        <Badge variant={snapshot.validation.ok ? "default" : "destructive"}>
-                          {snapshot.validation.ok ? t("common.yes") : t("common.no")}
-                        </Badge>
+                        <div className="flex items-center gap-2">
+                          <Badge variant={snapshot.validation.ok ? "default" : "destructive"}>
+                            {snapshot.validation.ok ? t("common.yes") : t("common.no")}
+                          </Badge>
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            disabled={busyAction !== null || snapshot.active}
+                            onClick={() => handleRollback(snapshot.releaseVersion)}
+                          >
+                            {t("a2gControlPlane.rollback")}
+                          </Button>
+                        </div>
                       </div>
                     ))}
                     {(releaseContext?.snapshots.length ?? 0) === 0 && (
                       <div className="text-sm text-muted-foreground">
                         {t("a2gControlPlane.noSnapshots")}
+                      </div>
+                    )}
+                  </div>
+                </div>
+                <div className="space-y-2">
+                  <div className="font-medium">
+                    {t("a2gControlPlane.auditTitle")}
+                  </div>
+                  <div className="space-y-2">
+                    {auditEvents.slice(0, 5).map((event) => (
+                      <div
+                        key={event.id}
+                        className="rounded-md border p-3 text-sm"
+                      >
+                        <div className="flex items-center justify-between gap-3">
+                          <div className="font-medium">{event.type}</div>
+                          <div className="text-xs text-muted-foreground">
+                            {event.timestamp}
+                          </div>
+                        </div>
+                        <div className="mt-1 text-xs text-muted-foreground">
+                          {[event.releaseVersion, event.publishedBy]
+                            .filter(Boolean)
+                            .join(" · ")}
+                        </div>
+                      </div>
+                    ))}
+                    {auditEvents.length === 0 && (
+                      <div className="text-sm text-muted-foreground">
+                        {t("a2gControlPlane.noAuditEvents")}
                       </div>
                     )}
                   </div>

@@ -1,5 +1,6 @@
 import type {
   A2GControlPlaneData,
+  A2GAuditEvent,
   A2GDiffPayload,
   A2GDraftPayload,
   A2GGeneratePayload,
@@ -265,6 +266,32 @@ class ApiClient {
       publishedBy,
       spec,
     });
+  }
+
+  async publishA2GDraft(
+    spec: Record<string, unknown>,
+    draftId: string = 'default',
+    publishedBy: string = 'ui-publish',
+  ): Promise<{ ok: boolean; activeVersion: string }> {
+    return this.post<{ ok: boolean; activeVersion: string }>('/a2g/publish', {
+      draftId,
+      publishedBy,
+      spec,
+    });
+  }
+
+  async rollbackA2GSnapshot(
+    releaseVersion: string,
+    publishedBy: string = 'ui-rollback',
+  ): Promise<{ ok: boolean; activeVersion: string }> {
+    return this.post<{ ok: boolean; activeVersion: string }>('/a2g/rollback', {
+      releaseVersion,
+      publishedBy,
+    });
+  }
+
+  async getA2GAudit(limit: number = 50): Promise<{ ok: boolean; events: A2GAuditEvent[] }> {
+    return this.get<{ ok: boolean; events: A2GAuditEvent[] }>(`/a2g/audit?limit=${limit}`);
   }
 
   // Save configuration (new endpoint)
