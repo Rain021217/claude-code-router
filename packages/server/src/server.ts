@@ -3,6 +3,7 @@ import { readConfigFile, writeConfigFile, backupConfigFile } from "./utils";
 import { join } from "path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import { createHash } from "node:crypto";
 import fastifyStatic from "@fastify/static";
 import { readdirSync, statSync, readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync, rmSync } from "fs";
 import { homedir } from "os";
@@ -48,6 +49,9 @@ export const createServer = async (config: any): Promise<any> => {
       pythonPath: process.env.A2G_PYTHONPATH || "",
       draftsDir:
         process.env.A2G_DRAFTS_DIR || join(HOME_DIR, "state", "a2g-drafts"),
+      controlPlaneStateDir:
+        process.env.A2G_CONTROL_PLANE_STATE_DIR ||
+        join(HOME_DIR, "state", "a2g-control-plane"),
       tmpDir: join(homeA2GDir, "tmp"),
     };
   };
@@ -77,6 +81,19 @@ export const createServer = async (config: any): Promise<any> => {
     return join(draftsDir, `${draftId}.spec.json`);
   };
 
+  const getControlPlaneMetadataPath = () => {
+    const { controlPlaneStateDir } = getA2GPaths();
+    ensureA2GDir(controlPlaneStateDir);
+    return join(controlPlaneStateDir, "metadata.v1.json");
+  };
+
+  const getSnapshotDir = () => {
+    const { controlPlaneStateDir } = getA2GPaths();
+    const snapshotsDir = join(controlPlaneStateDir, "snapshots");
+    ensureA2GDir(snapshotsDir);
+    return snapshotsDir;
+  };
+
   const loadDraftSpec = (draftId = "default") => {
     const draftPath = getDraftFilePath(draftId);
     const { specPath } = getA2GPaths();
@@ -93,6 +110,192 @@ export const createServer = async (config: any): Promise<any> => {
     const draftPath = getDraftFilePath(draftId);
     writeFileSync(draftPath, `${JSON.stringify(spec, null, 2)}\n`, "utf-8");
     return draftPath;
+  };
+
+  const stableSerialize = (value: unknown): string => {
+    if (Array.isArray(value)) {
+      return `[${value.map((item) => stableSerialize(item)).join(",")}]`;
+    }
+    if (value && typeof value === "object") {
+      const entries = Object.entries(value as Record<string, unknown>).sort(([a], [b]) =>
+        a.localeCompare(b),
+      );
+      return `{${entries
+        .map(([key, entryValue]) => `${JSON.stringify(key)}:${stableSerialize(entryValue)}`)
+        .join(",")}}`;
+    }
+    return JSON.stringify(value);
+  };
+
+  const computeRevision = (payload: Record<string, unknown>) =>
+    createHash("sha256").update(stableSerialize(payload)).digest("hex").slice(0, 12);
+
+  const flattenJson = (
+    value: unknown,
+    prefix = "",
+    output: Record<string, string> = {},
+  ) => {
+    if (Array.isArray(value)) {
+      if (value.length === 0) {
+        output[prefix || "$"] = "[]";
+        return output;
+      }
+      value.forEach((item, index) => {
+        flattenJson(item, prefix ? `${prefix}[${index}]` : `$[${index}]`, output);
+      });
+      return output;
+    }
+    if (value && typeof value === "object") {
+      const entries = Object.entries(value as Record<string, unknown>);
+      if (entries.length === 0) {
+        output[prefix || "$"] = "{}";
+        return output;
+      }
+      entries.forEach(([key, entryValue]) => {
+        flattenJson(entryValue, prefix ? `${prefix}.${key}` : key, output);
+      });
+      return output;
+    }
+    output[prefix || "$"] = JSON.stringify(value);
+    return output;
+  };
+
+  const buildJsonDiff = (before: Record<string, unknown>, after: Record<string, unknown>) => {
+    const beforeFlat = flattenJson(before);
+    const afterFlat = flattenJson(after);
+    const paths = Array.from(
+      new Set([...Object.keys(beforeFlat), ...Object.keys(afterFlat)]),
+    ).sort();
+    const changes: Array<{
+      path: string;
+      type: "added" | "removed" | "changed";
+      before?: string;
+      after?: string;
+    }> = [];
+
+    for (const path of paths) {
+      if (!(path in beforeFlat)) {
+        changes.push({ path, type: "added", after: afterFlat[path] });
+        continue;
+      }
+      if (!(path in afterFlat)) {
+        changes.push({ path, type: "removed", before: beforeFlat[path] });
+        continue;
+      }
+      if (beforeFlat[path] !== afterFlat[path]) {
+        changes.push({
+          path,
+          type: "changed",
+          before: beforeFlat[path],
+          after: afterFlat[path],
+        });
+      }
+    }
+
+    const summary = {
+      total: changes.length,
+      added: changes.filter((item) => item.type === "added").length,
+      removed: changes.filter((item) => item.type === "removed").length,
+      changed: changes.filter((item) => item.type === "changed").length,
+    };
+
+    return {
+      hasChanges: changes.length > 0,
+      summary,
+      changes: changes.slice(0, 100),
+    };
+  };
+
+  const loadControlPlaneMetadata = () => {
+    const metadataPath = getControlPlaneMetadataPath();
+    if (!existsSync(metadataPath)) {
+      return {
+        activeVersion: null,
+        snapshots: [] as Array<Record<string, unknown>>,
+      };
+    }
+    return readJsonFile(metadataPath);
+  };
+
+  const saveControlPlaneMetadata = (metadata: Record<string, unknown>) => {
+    const metadataPath = getControlPlaneMetadataPath();
+    writeFileSync(metadataPath, `${JSON.stringify(metadata, null, 2)}\n`, "utf-8");
+    return metadata;
+  };
+
+  const createSnapshotVersion = (revision: string) => {
+    const timestamp = new Date().toISOString().replace(/[-:TZ.]/g, "").slice(0, 14);
+    return `draft-${timestamp}-${revision.slice(0, 6)}`;
+  };
+
+  const saveSnapshot = ({
+    releaseVersion,
+    spec,
+    generatedConfig,
+    validation,
+    publishedBy,
+  }: {
+    releaseVersion: string;
+    spec: Record<string, unknown>;
+    generatedConfig: Record<string, unknown>;
+    validation: { ok: boolean; message: string };
+    publishedBy: string;
+  }) => {
+    const snapshotsDir = getSnapshotDir();
+    const snapshotPath = join(snapshotsDir, `${releaseVersion}.json`);
+    const snapshot = {
+      releaseVersion,
+      draftRevision: computeRevision(spec),
+      createdAt: new Date().toISOString(),
+      publishedAt: null,
+      publishedBy,
+      active: false,
+      validation,
+      spec,
+      generatedConfig,
+    };
+    writeFileSync(snapshotPath, `${JSON.stringify(snapshot, null, 2)}\n`, "utf-8");
+    return snapshot;
+  };
+
+  const getReleaseContext = async (draftId = "default") => {
+    const metadata = loadControlPlaneMetadata();
+    const draft = loadDraftSpec(draftId);
+    const generatedConfig = await runA2GGenerate(draft.spec);
+    const validation = await runA2GValidate(draft.spec);
+    const draftRevision = computeRevision(draft.spec);
+    const currentConfig = await readConfigFile();
+    const specPath = getA2GPaths().specPath;
+    const sourceSpec =
+      specPath && existsSync(specPath)
+        ? (readJsonFile(specPath) as Record<string, unknown>)
+        : {};
+    const specDiff = buildJsonDiff(sourceSpec, draft.spec);
+    const generatedDiff = buildJsonDiff(currentConfig, generatedConfig);
+
+    return {
+      draftId,
+      draftSource: draft.source,
+      draftRevision,
+      activeVersion: metadata.activeVersion || null,
+      latestSnapshotVersion:
+        Array.isArray(metadata.snapshots) && metadata.snapshots.length > 0
+          ? (metadata.snapshots[0] as any).releaseVersion || null
+          : null,
+      publishedAt:
+        Array.isArray(metadata.snapshots) && metadata.snapshots.length > 0
+          ? (metadata.snapshots[0] as any).publishedAt || null
+          : null,
+      publishedBy:
+        Array.isArray(metadata.snapshots) && metadata.snapshots.length > 0
+          ? (metadata.snapshots[0] as any).publishedBy || null
+          : null,
+      hasUnpublishedChanges: specDiff.hasChanges || generatedDiff.hasChanges,
+      validation,
+      specDiff,
+      generatedDiff,
+      snapshots: Array.isArray(metadata.snapshots) ? metadata.snapshots.slice(0, 10) : [],
+    };
   };
 
   const summarizeGeneratedConfig = (generatedConfig: Record<string, any>) => {
@@ -358,6 +561,8 @@ export const createServer = async (config: any): Promise<any> => {
           ].filter(Boolean)
         : [];
 
+      const releaseContext = await getReleaseContext("default");
+
       return {
         status: "ok",
         mode: "a2g_control_plane_preview",
@@ -386,10 +591,21 @@ export const createServer = async (config: any): Promise<any> => {
           overview: poolData.overview || {},
           recentEvents: Array.isArray(poolData.recentEvents) ? poolData.recentEvents.slice(0, 5) : [],
         },
+        releaseSummary: {
+          draftRevision: releaseContext.draftRevision,
+          activeVersion: releaseContext.activeVersion,
+          latestSnapshotVersion: releaseContext.latestSnapshotVersion,
+          hasUnpublishedChanges: releaseContext.hasUnpublishedChanges,
+          snapshotCount: Array.isArray(releaseContext.snapshots)
+            ? releaseContext.snapshots.length
+            : 0,
+          validation: releaseContext.validation,
+        },
         notes: [
           "Current UI prototype does not publish config changes yet.",
           "Source of truth remains config.spec.json -> generate -> config.json -> Git.",
           "DraftConfig plus generate/validate are available without mutating live config.",
+          "Snapshot and diff preview are available before publish/rollback are implemented.",
         ],
       };
     } catch (error: any) {
@@ -503,6 +719,97 @@ export const createServer = async (config: any): Promise<any> => {
       const formatted = formatA2GScriptError(error);
       reply.status(formatted.statusCode).send({
         error: "Failed to validate candidate config",
+        message: formatted.message,
+        details: formatted.details,
+      });
+    }
+  });
+
+  app.get("/api/a2g/release-context", async (req: any, reply: any) => {
+    try {
+      const draftId = ((req.query as any)?.draftId as string) || "default";
+      return {
+        ok: true,
+        ...(await getReleaseContext(draftId)),
+      };
+    } catch (error: any) {
+      reply.status(500).send({
+        error: "Failed to load release context",
+        message: error?.message || "unknown error",
+      });
+    }
+  });
+
+  app.get("/api/a2g/diff", async (req: any, reply: any) => {
+    try {
+      const draftId = ((req.query as any)?.draftId as string) || "default";
+      const releaseContext = await getReleaseContext(draftId);
+      return {
+        ok: true,
+        draftId,
+        draftRevision: releaseContext.draftRevision,
+        hasUnpublishedChanges: releaseContext.hasUnpublishedChanges,
+        specDiff: releaseContext.specDiff,
+        generatedDiff: releaseContext.generatedDiff,
+      };
+    } catch (error: any) {
+      reply.status(500).send({
+        error: "Failed to build diff preview",
+        message: error?.message || "unknown error",
+      });
+    }
+  });
+
+  app.post("/api/a2g/snapshots", async (req: any, reply: any) => {
+    try {
+      const draftId = req.body?.draftId || "default";
+      const publishedBy = req.body?.publishedBy || "ui-preview";
+      const draft =
+        req.body?.spec && typeof req.body.spec === "object" && !Array.isArray(req.body.spec)
+          ? { spec: req.body.spec as Record<string, unknown>, source: "request" }
+          : loadDraftSpec(draftId);
+      const generatedConfig = await runA2GGenerate(draft.spec);
+      const validation = await runA2GValidate(draft.spec);
+      const releaseVersion = createSnapshotVersion(computeRevision(draft.spec));
+      const snapshot = saveSnapshot({
+        releaseVersion,
+        spec: draft.spec,
+        generatedConfig,
+        validation,
+        publishedBy,
+      });
+
+      const metadata = loadControlPlaneMetadata();
+      const existingSnapshots = Array.isArray(metadata.snapshots)
+        ? metadata.snapshots.filter(
+            (item: any) => item?.releaseVersion !== snapshot.releaseVersion,
+          )
+        : [];
+      metadata.snapshots = [
+        {
+          releaseVersion: snapshot.releaseVersion,
+          draftRevision: snapshot.draftRevision,
+          createdAt: snapshot.createdAt,
+          publishedAt: snapshot.publishedAt,
+          publishedBy: snapshot.publishedBy,
+          active: snapshot.active,
+          validation: snapshot.validation,
+        },
+        ...existingSnapshots,
+      ];
+      if (!("activeVersion" in metadata)) {
+        metadata.activeVersion = null;
+      }
+      saveControlPlaneMetadata(metadata);
+
+      return {
+        ok: true,
+        snapshot: metadata.snapshots[0],
+      };
+    } catch (error: any) {
+      const formatted = formatA2GScriptError(error);
+      reply.status(formatted.statusCode).send({
+        error: "Failed to create snapshot",
         message: formatted.message,
         details: formatted.details,
       });

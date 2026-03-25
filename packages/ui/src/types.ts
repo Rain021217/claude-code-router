@@ -105,6 +105,17 @@ export interface A2GControlPlaneData {
     overview: Record<string, unknown>;
     recentEvents: Array<Record<string, unknown>>;
   };
+  releaseSummary: {
+    draftRevision: string;
+    activeVersion: string | null;
+    latestSnapshotVersion: string | null;
+    hasUnpublishedChanges: boolean;
+    snapshotCount: number;
+    validation: {
+      ok: boolean;
+      message: string;
+    };
+  };
   notes: string[];
 }
 
@@ -128,4 +139,53 @@ export interface A2GGeneratePayload {
 export interface A2GValidatePayload extends A2GGeneratePayload {
   inSyncWithRepoConfig: boolean;
   message: string;
+}
+
+export interface A2GDiffPayload {
+  ok: boolean;
+  draftId: string;
+  draftRevision: string;
+  hasUnpublishedChanges: boolean;
+  specDiff: {
+    hasChanges: boolean;
+    summary: { total: number; added: number; removed: number; changed: number };
+    changes: Array<{ path: string; type: "added" | "removed" | "changed"; before?: string; after?: string }>;
+  };
+  generatedDiff: {
+    hasChanges: boolean;
+    summary: { total: number; added: number; removed: number; changed: number };
+    changes: Array<{ path: string; type: "added" | "removed" | "changed"; before?: string; after?: string }>;
+  };
+}
+
+export interface A2GSnapshotMeta {
+  releaseVersion: string;
+  draftRevision: string;
+  createdAt: string;
+  publishedAt: string | null;
+  publishedBy: string;
+  active: boolean;
+  validation: {
+    ok: boolean;
+    message: string;
+  };
+}
+
+export interface A2GReleaseContextPayload {
+  ok: boolean;
+  draftId: string;
+  draftSource: string;
+  draftRevision: string;
+  activeVersion: string | null;
+  latestSnapshotVersion: string | null;
+  publishedAt: string | null;
+  publishedBy: string | null;
+  hasUnpublishedChanges: boolean;
+  validation: {
+    ok: boolean;
+    message: string;
+  };
+  specDiff: A2GDiffPayload["specDiff"];
+  generatedDiff: A2GDiffPayload["generatedDiff"];
+  snapshots: A2GSnapshotMeta[];
 }

@@ -1,7 +1,10 @@
 import type {
   A2GControlPlaneData,
+  A2GDiffPayload,
   A2GDraftPayload,
   A2GGeneratePayload,
+  A2GReleaseContextPayload,
+  A2GSnapshotMeta,
   A2GValidatePayload,
   Config,
   Provider,
@@ -242,6 +245,26 @@ class ApiClient {
 
   async validateA2GConfig(spec: Record<string, unknown>, draftId: string = 'default'): Promise<A2GValidatePayload> {
     return this.post<A2GValidatePayload>('/a2g/validate', { draftId, spec });
+  }
+
+  async getA2GReleaseContext(draftId: string = 'default'): Promise<A2GReleaseContextPayload> {
+    return this.get<A2GReleaseContextPayload>(`/a2g/release-context?draftId=${encodeURIComponent(draftId)}`);
+  }
+
+  async getA2GDiff(draftId: string = 'default'): Promise<A2GDiffPayload> {
+    return this.get<A2GDiffPayload>(`/a2g/diff?draftId=${encodeURIComponent(draftId)}`);
+  }
+
+  async createA2GSnapshot(
+    spec: Record<string, unknown>,
+    draftId: string = 'default',
+    publishedBy: string = 'ui-preview',
+  ): Promise<{ ok: boolean; snapshot: A2GSnapshotMeta }> {
+    return this.post<{ ok: boolean; snapshot: A2GSnapshotMeta }>('/a2g/snapshots', {
+      draftId,
+      publishedBy,
+      spec,
+    });
   }
 
   // Save configuration (new endpoint)
