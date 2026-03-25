@@ -21,6 +21,7 @@ interface ProviderCooldownState {
 
 interface PoolManagerStats {
   selectedRoutes: number;
+  coolingSkips: number;
   retryableErrors: number;
   failFastErrors: number;
   cooldownTransitions: number;
@@ -106,8 +107,10 @@ interface PoolManagerPersistedState {
 
 interface PoolHealthOverview {
   coolingByReason: Record<string, number>;
+  coolingByScenario: Record<string, number>;
   recentEventCounts: Record<string, number>;
   activeScenarios: number;
+  selectionCountsByScenario: Record<string, number>;
   lastEventAt: number | null;
 }
 
@@ -125,6 +128,7 @@ export class PoolManager {
   >();
   private stats: PoolManagerStats = {
     selectedRoutes: 0,
+    coolingSkips: 0,
     retryableErrors: 0,
     failFastErrors: 0,
     cooldownTransitions: 0,
@@ -281,6 +285,7 @@ export class PoolManager {
     this.recentEvents = [];
     this.stats = {
       selectedRoutes: 0,
+      coolingSkips: 0,
       retryableErrors: 0,
       failFastErrors: 0,
       cooldownTransitions: 0,
@@ -478,13 +483,22 @@ export class PoolManager {
   private getAllowedFailsForReason(
     reason: CooldownReason,
     statusCode: number | undefined,
+    scenarioType: string | undefined,
     rawConfig?: PoolManagerConfig
   ): number {
     const config = this.getConfig(rawConfig);
     const statusKey =
       typeof statusCode === "number" && statusCode >= 500 ? "5xx" : undefined;
+    const scenarioPrefix = scenarioType ? `${scenarioType}.` : "";
 
     return (
+      (scenarioPrefix && config.allowedFailsPolicy[`${scenarioPrefix}${reason}`]) ||
+      (scenarioPrefix &&
+        typeof statusCode === "number" &&
+        config.allowedFailsPolicy[`${scenarioPrefix}${String(statusCode)}`]) ||
+      (scenarioPrefix &&
+        statusKey &&
+        config.allowedFailsPolicy[`${scenarioPrefix}${statusKey}`]) ||
       config.allowedFailsPolicy[reason] ||
       (typeof statusCode === "number" &&
         config.allowedFailsPolicy[String(statusCode)]) ||
@@ -496,12 +510,13 @@ export class PoolManager {
   markCooldown(params: {
     routeKey: string;
     reason: CooldownReason;
+    scenarioType?: string;
     statusCode?: number;
     message?: string;
     rawConfig?: PoolManagerConfig;
     logger?: any;
   }) {
-    const { routeKey, reason, statusCode, message, rawConfig, logger } =
+    const { routeKey, reason, scenarioType, statusCode, message, rawConfig, logger } =
       params;
     const config = this.getConfig(rawConfig);
     if (!config.enabled) {
@@ -526,6 +541,7 @@ export class PoolManager {
     const allowedFails = this.getAllowedFailsForReason(
       reason,
       statusCode,
+      scenarioType,
       rawConfig
     );
 
@@ -534,6 +550,7 @@ export class PoolManager {
         {
           routeKey,
           reason,
+          scenarioType,
           statusCode,
           consecutiveFailures,
           allowedFails,
@@ -567,6 +584,7 @@ export class PoolManager {
       type: "cooldown",
       routeKey,
       reason,
+      scenarioType,
       statusCode,
       details: message,
     });
@@ -574,6 +592,7 @@ export class PoolManager {
       {
         routeKey,
         reason,
+        scenarioType,
         statusCode,
         cooldownMs,
         cooldownUntil: state.cooldownUntil,
@@ -608,6 +627,7 @@ export class PoolManager {
     this.recentEvents = [];
     this.stats = {
       selectedRoutes: 0,
+      coolingSkips: 0,
       retryableErrors: 0,
       failFastErrors: 0,
       cooldownTransitions: 0,
@@ -734,6 +754,22 @@ export class PoolManager {
     this.stats.selectedRoutes += 1;
     this.pushEvent({
       type: "selected_route",
+      scenarioType,
+      routeKey,
+    });
+    this.schedulePersist(rawConfig, logger);
+  }
+
+  noteCoolingSkip(params: {
+    scenarioType: string;
+    routeKey: string;
+    rawConfig?: PoolManagerConfig;
+    logger?: any;
+  }) {
+    const { scenarioType, routeKey, rawConfig, logger } = params;
+    this.stats.coolingSkips += 1;
+    this.pushEvent({
+      type: "cooling_skip",
       scenarioType,
       routeKey,
     });
@@ -882,6 +918,12 @@ export class PoolManager {
         );
         return route;
       }
+      this.noteCoolingSkip({
+        scenarioType,
+        routeKey: route,
+        rawConfig,
+        logger,
+      });
     }
 
     const fallbackRoute = uniqueCandidates[startIndex % uniqueCandidates.length];
@@ -949,6 +991,16 @@ export class PoolManager {
       acc[state.reason] = (acc[state.reason] || 0) + 1;
       return acc;
     }, {});
+    const coolingByScenario = this.recentEvents.reduce<Record<string, number>>(
+      (acc, event) => {
+        if (event.type !== "cooling_skip" || !event.scenarioType) {
+          return acc;
+        }
+        acc[event.scenarioType] = (acc[event.scenarioType] || 0) + 1;
+        return acc;
+      },
+      {}
+    );
     const recentEventCounts = this.recentEvents.reduce<Record<string, number>>(
       (acc, event) => {
         acc[event.type] = (acc[event.type] || 0) + 1;
@@ -956,10 +1008,18 @@ export class PoolManager {
       },
       {}
     );
+    const selectionCountsByScenario = scenarioSelections.reduce<
+      Record<string, number>
+    >((acc, selection) => {
+      acc[selection.scenarioType] = selection.count;
+      return acc;
+    }, {});
     const overview: PoolHealthOverview = {
       coolingByReason,
+      coolingByScenario,
       recentEventCounts,
       activeScenarios: scenarioSelections.length,
+      selectionCountsByScenario,
       lastEventAt:
         this.recentEvents.length > 0
           ? this.recentEvents[this.recentEvents.length - 1].timestamp

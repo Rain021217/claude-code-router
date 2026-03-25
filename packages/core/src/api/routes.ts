@@ -528,6 +528,7 @@ async function sendRequestToProvider(
       poolManager.markCooldown({
         routeKey: `${provider.name},${requestBody.model}`,
         reason: "transport_error",
+        scenarioType: (context?.req as any)?.scenarioType || "default",
         message: error?.message,
       rawConfig: poolManagerConfig,
       logger: fastify.log,
@@ -565,6 +566,7 @@ async function sendRequestToProvider(
         poolManager.markCooldown({
         routeKey: `${provider.name},${requestBody.model}`,
           reason: failure.reason,
+          scenarioType: (context?.req as any)?.scenarioType || "default",
           statusCode: response.status,
         message: errorText,
         rawConfig: poolManagerConfig,
