@@ -1,5 +1,6 @@
 import { createMemoryRouter, Navigate } from 'react-router-dom';
 import App from './App';
+import { A2GControlPlane } from '@/components/A2GControlPlane';
 import { Login } from '@/components/Login';
 import { DebugPage } from '@/components/DebugPage';
 import { Presets } from '@/components/Presets';
@@ -22,6 +23,10 @@ export const router = createMemoryRouter([
   {
     path: '/presets',
     element: <ProtectedRoute><Presets /></ProtectedRoute>,
+  },
+  {
+    path: '/a2g',
+    element: <ProtectedRoute><A2GControlPlane /></ProtectedRoute>,
   },
   {
     path: '/debug',

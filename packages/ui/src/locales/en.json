@@ -29,6 +29,7 @@
     "json_editor": "JSON Editor",
     "log_viewer": "Log Viewer",
     "presets": "Presets",
+    "a2g_control_plane": "A2G Control Plane",
     "language": "Language",
     "check_updates": "Check for Updates"
   },
@@ -298,5 +299,36 @@
       "apply": "Apply",
       "cancel": "Cancel"
     }
+  },
+  "a2gControlPlane": {
+    "title": "A2G Control Plane",
+    "description": "First UI prototype for the A2G control plane.",
+    "backToDashboard": "Back to Dashboard",
+    "refresh": "Refresh",
+    "loading": "Loading A2G control plane...",
+    "providerCount": "Providers",
+    "routeCount": "Routes",
+    "transformerCount": "Transformers",
+    "activeScenarios": "Active Scenarios",
+    "pipelineTitle": "Config Pipeline",
+    "pipelineDescription": "The current source-of-truth chain remains read-only in this prototype.",
+    "runtimeTitle": "Runtime Summary",
+    "runtimeDescription": "Live router footprint derived from the current generated config and pool state.",
+    "specSummaryTitle": "Spec Summary",
+    "specSummaryDescription": "This is read from the mounted A2G config spec, not from transient runtime edits.",
+    "poolSummaryTitle": "Pool Summary",
+    "poolSummaryDescription": "Current cooling and failure state from /health/pool.",
+    "notesTitle": "Operator Notes",
+    "exists": "Available",
+    "missing": "Missing",
+    "discovery": "Auto Discovery",
+    "declaredProviders": "Declared Providers",
+    "modelTiers": "Model Tiers",
+    "scenarioCount": "Scenarios",
+    "coolingRoutes": "{{count}} cooling",
+    "coolingRoutesLabel": "Cooling Routes",
+    "recentFailures": "Routes With Failures",
+    "retryableErrors": "Retryable Errors",
+    "failFastErrors": "Fail-fast Errors"
   }
 }

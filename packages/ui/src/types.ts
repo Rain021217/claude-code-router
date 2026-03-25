@@ -68,3 +68,42 @@ export interface Config {
 }
 
 export type AccessLevel = 'restricted' | 'full';
+
+export interface A2GPathStatus {
+  label: string;
+  path: string;
+  exists: boolean;
+}
+
+export interface A2GControlPlaneData {
+  status: string;
+  mode: string;
+  sourceOfTruth: string;
+  runtime: {
+    host: string;
+    port: number;
+    providerCount: number;
+    transformerCount: number;
+    routeCount: number;
+    routerTargets: string[];
+  };
+  specSummary: {
+    providerDiscoveryEnabled: boolean;
+    providerDiscoveryPrefix: string | null;
+    declaredProviderCount: number;
+    modelTierCount: number;
+    scenarioCount: number;
+    scenarios: string[];
+  } | null;
+  paths: A2GPathStatus[];
+  poolSummary: {
+    status: string;
+    coolingRouteCount: number;
+    routesWithRecentFailures: number;
+    activeScenarios: number;
+    stats: Record<string, number>;
+    overview: Record<string, unknown>;
+    recentEvents: Array<Record<string, unknown>>;
+  };
+  notes: string[];
+}

@@ -113,6 +113,105 @@ export const createServer = async (config: any): Promise<any> => {
     return { success: true, message: "Config saved successfully" };
   });
 
+  app.get("/api/a2g/control-plane", async (_req: any, reply: any) => {
+    try {
+      const config = await readConfigFile();
+      const specPath = process.env.A2G_CONFIG_SPEC_PATH || "";
+      const generatorPath = process.env.A2G_GENERATOR_SCRIPT_PATH || "";
+      const validatorPath = process.env.A2G_VALIDATOR_SCRIPT_PATH || "";
+      const generatedConfigPath = process.env.A2G_GENERATED_CONFIG_PATH || join(HOME_DIR, "config.json");
+      const sourceOfTruth =
+        process.env.A2G_SOURCE_OF_TRUTH || "config.spec.json -> generate -> config.json -> Git";
+
+      const poolResponse = await app.inject({
+        method: "GET",
+        url: "/health/pool",
+      });
+
+      const poolData = poolResponse.statusCode === 200
+        ? JSON.parse(poolResponse.payload || "{}")
+        : {
+            status: "unavailable",
+            stats: {},
+            overview: {},
+            recentEvents: [],
+            pool: [],
+            failures: [],
+          };
+
+      let specSummary: any = null;
+      if (specPath && existsSync(specPath)) {
+        const spec = JSON.parse(readFileSync(specPath, "utf-8"));
+        specSummary = {
+          providerDiscoveryEnabled: !!spec.provider_discovery?.enabled,
+          providerDiscoveryPrefix: spec.provider_discovery?.env_prefix || null,
+          declaredProviderCount: Array.isArray(spec.providers) ? spec.providers.length : 0,
+          modelTierCount:
+            spec.models && typeof spec.models === "object" ? Object.keys(spec.models).length : 0,
+          scenarioCount:
+            spec.router?.scenarios && typeof spec.router.scenarios === "object"
+              ? Object.keys(spec.router.scenarios).length
+              : 0,
+          scenarios:
+            spec.router?.scenarios && typeof spec.router.scenarios === "object"
+              ? Object.keys(spec.router.scenarios)
+              : [],
+        };
+      }
+
+      const routerTargets = config.Router
+        ? [
+            config.Router.default,
+            config.Router.background,
+            config.Router.think,
+            config.Router.longContext,
+            config.Router.webSearch,
+            config.Router.image,
+          ].filter(Boolean)
+        : [];
+
+      return {
+        status: "ok",
+        mode: "a2g_control_plane_preview",
+        sourceOfTruth,
+        runtime: {
+          host: config.HOST || "127.0.0.1",
+          port: config.PORT || 3456,
+          providerCount: Array.isArray(config.Providers) ? config.Providers.length : 0,
+          transformerCount: Array.isArray(config.transformers) ? config.transformers.length : 0,
+          routeCount: routerTargets.length,
+          routerTargets,
+        },
+        specSummary,
+        paths: [
+          { label: "config.spec.json", path: specPath, exists: !!specPath && existsSync(specPath) },
+          { label: "generate_config.py", path: generatorPath, exists: !!generatorPath && existsSync(generatorPath) },
+          { label: "validate_config.py", path: validatorPath, exists: !!validatorPath && existsSync(validatorPath) },
+          { label: "config.json", path: generatedConfigPath, exists: !!generatedConfigPath && existsSync(generatedConfigPath) },
+        ],
+        poolSummary: {
+          status: poolData.status || "unknown",
+          coolingRouteCount: Array.isArray(poolData.pool) ? poolData.pool.length : 0,
+          routesWithRecentFailures: Array.isArray(poolData.failures) ? poolData.failures.length : 0,
+          activeScenarios: poolData.overview?.activeScenarios || 0,
+          stats: poolData.stats || {},
+          overview: poolData.overview || {},
+          recentEvents: Array.isArray(poolData.recentEvents) ? poolData.recentEvents.slice(0, 5) : [],
+        },
+        notes: [
+          "Current UI prototype is read-only and does not publish config changes yet.",
+          "Source of truth remains config.spec.json -> generate -> config.json -> Git.",
+          "Next milestone is DraftConfig plus generate/validate serviceization.",
+        ],
+      };
+    } catch (error: any) {
+      reply.status(500).send({
+        error: "Failed to build A2G control plane payload",
+        message: error?.message || "unknown error",
+      });
+    }
+  });
+
   // Register static file serving with caching
   app.register(fastifyStatic, {
     root: join(__dirname, "..", "dist"),

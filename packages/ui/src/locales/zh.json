@@ -29,6 +29,7 @@
     "json_editor": "JSON 编辑器",
     "log_viewer": "日志查看器",
     "presets": "预设",
+    "a2g_control_plane": "A2G 控制台",
     "language": "语言",
     "check_updates": "检查更新"
   },
@@ -297,5 +298,36 @@
       "apply": "应用",
       "cancel": "取消"
     }
+  },
+  "a2gControlPlane": {
+    "title": "A2G 控制台",
+    "description": "A2G 控制平面第一步原型。",
+    "backToDashboard": "返回主面板",
+    "refresh": "刷新",
+    "loading": "正在加载 A2G 控制台...",
+    "providerCount": "供应商数",
+    "routeCount": "路由数",
+    "transformerCount": "转换器数",
+    "activeScenarios": "活跃场景数",
+    "pipelineTitle": "配置管线",
+    "pipelineDescription": "当前原型仍然是只读展示，正式发布链路没有改成 UI 直写。",
+    "runtimeTitle": "运行摘要",
+    "runtimeDescription": "基于当前生成配置与池状态的实时运行视图。",
+    "specSummaryTitle": "Spec 摘要",
+    "specSummaryDescription": "此处读取的是挂载进来的 A2G config spec，不是临时运行态编辑结果。",
+    "poolSummaryTitle": "池状态摘要",
+    "poolSummaryDescription": "来自 /health/pool 的当前冷却与失败状态。",
+    "notesTitle": "运维提示",
+    "exists": "可用",
+    "missing": "缺失",
+    "discovery": "自动发现",
+    "declaredProviders": "声明 Provider 数",
+    "modelTiers": "模型层级数",
+    "scenarioCount": "场景数",
+    "coolingRoutes": "{{count}} 条冷却中",
+    "coolingRoutesLabel": "冷却路由数",
+    "recentFailures": "近期失败路由数",
+    "retryableErrors": "可重试错误",
+    "failFastErrors": "快速失败错误"
   }
 }

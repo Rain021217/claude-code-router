@@ -1,4 +1,4 @@
-import type { Config, Provider, Transformer } from '@/types';
+import type { A2GControlPlaneData, Config, Provider, Transformer } from '@/types';
 
 // 日志聚合响应类型
 interface GroupedLogsResponse {
@@ -210,6 +210,10 @@ class ApiClient {
   // Get configuration (new endpoint)
   async getConfigNew(): Promise<Config> {
     return this.get<Config>('/config');
+  }
+
+  async getA2GControlPlane(): Promise<A2GControlPlaneData> {
+    return this.get<A2GControlPlaneData>('/a2g/control-plane');
   }
 
   // Save configuration (new endpoint)
