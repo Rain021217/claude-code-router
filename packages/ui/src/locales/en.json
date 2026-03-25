@@ -107,7 +107,6 @@
     "name_required": "Name is required",
     "name_duplicate": "A provider with this name already exists",
     "search": "Search providers..."
-
   },
   "router": {
     "title": "Router",
@@ -264,7 +263,6 @@
     "install_dialog_title": "Install Preset",
     "install_dialog_description": "Install a preset from a GitHub repository",
     "from_url": "From GitHub",
-    "github_repository": "GitHub Repository",
     "preset_url": "Repository URL",
     "preset_url_placeholder": "https://github.com/owner/repo",
     "preset_name": "Preset Name (Optional)",
@@ -393,6 +391,22 @@
     "noAuthProfiles": "No auth profiles yet.",
     "specDiffTitle": "Spec Diff",
     "generatedDiffTitle": "Generated Config Diff",
-    "diffSummary": "Total {{total}} · Changed {{changed}} · Added {{added}} · Removed {{removed}}"
+    "diffSummary": "Total {{total}} · Changed {{changed}} · Added {{added}} · Removed {{removed}}",
+    "fieldErrorsTitle": "Field-level validation feedback",
+    "impactRisk": "Risk Level",
+    "impactScenarios": "Changed Scenarios",
+    "impactProviders": "Changed Provider Slots",
+    "impactAuthChanges": "Auth-related Changes",
+    "impactChanged": "Any Changes",
+    "authDisplayName": "Display name",
+    "authApiKey": "API key",
+    "authSlot": "Slot",
+    "authProvider": "Provider",
+    "addApiKeyProfile": "Add API Key",
+    "authTestBeforeSave": "Test connectivity before save",
+    "authProfileCreated": "Auth profile created.",
+    "authProfileCreatedRestartRequired": "Auth profile created. Restart is required before runtime credentials apply.",
+    "authProfileTested": "Auth profile health check completed.",
+    "testAuthProfile": "Test"
   }
 }

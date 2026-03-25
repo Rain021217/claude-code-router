@@ -6,6 +6,7 @@ import { api } from "@/lib/api";
 import type {
   A2GControlPlaneData,
   A2GDiffPayload,
+  A2GFieldError,
   A2GGeneratePayload,
   A2GReleaseContextPayload,
   A2GAuthProfile,
@@ -55,6 +56,12 @@ export function A2GControlPlane() {
     A2GReleaseContextPayload["auditEvents"]
   >([]);
   const [authProfiles, setAuthProfiles] = useState<A2GAuthProfile[]>([]);
+  const [fieldErrors, setFieldErrors] = useState<A2GFieldError[]>([]);
+  const [authDisplayName, setAuthDisplayName] = useState("");
+  const [authApiKey, setAuthApiKey] = useState("");
+  const [authSlot, setAuthSlot] = useState("");
+  const [authProvider, setAuthProvider] = useState("gemini");
+  const [authTestBeforeSave, setAuthTestBeforeSave] = useState(true);
   const [auditTypeFilter, setAuditTypeFilter] = useState("all");
   const [auditReleaseFilter, setAuditReleaseFilter] = useState("");
   const [auditSinceFilter, setAuditSinceFilter] = useState("");
@@ -108,11 +115,14 @@ export function A2GControlPlane() {
   const runAction = async (action: string, runner: () => Promise<void>) => {
     setBusyAction(action);
     setActionError(null);
+    setFieldErrors([]);
     setDraftMessage(null);
     try {
       await runner();
     } catch (err) {
-      setActionError((err as Error).message);
+      const error = err as Error & { payload?: { fieldErrors?: A2GFieldError[] } };
+      setActionError(error.message);
+      setFieldErrors(Array.isArray(error.payload?.fieldErrors) ? error.payload!.fieldErrors : []);
     } finally {
       setBusyAction(null);
     }
@@ -210,6 +220,39 @@ export function A2GControlPlane() {
       setDiffPreview(null);
       await load(true);
       setDraftMessage(t("a2gControlPlane.draftReset"));
+    });
+
+  const handleCreateApiKeyProfile = () =>
+    runAction("auth-create", async () => {
+      const response = await api.createA2GApiKeyProfile({
+        displayName: authDisplayName,
+        apiKey: authApiKey,
+        provider: authProvider,
+        slot: authSlot.trim() ? Number(authSlot) : undefined,
+        test: authTestBeforeSave,
+      });
+      setAuthProfiles((current) => [response.profile, ...current]);
+      setAuthDisplayName("");
+      setAuthApiKey("");
+      setAuthSlot("");
+      setDraftMessage(
+        response.restartRequired
+          ? t("a2gControlPlane.authProfileCreatedRestartRequired")
+          : t("a2gControlPlane.authProfileCreated"),
+      );
+      const payload = await api.getA2GControlPlane();
+      setData(payload);
+    });
+
+  const handleTestAuthProfile = (profileId: string) =>
+    runAction(`auth-test:${profileId}`, async () => {
+      const response = await api.testA2GAuthProfile(profileId);
+      setAuthProfiles((current) =>
+        current.map((profile) =>
+          profile.id === profileId ? response.profile : profile,
+        ),
+      );
+      setDraftMessage(t("a2gControlPlane.authProfileTested"));
     });
 
   const loadAudit = async () => {
@@ -455,6 +498,26 @@ export function A2GControlPlane() {
                     {actionError}
                   </div>
                 )}
+                {fieldErrors.length > 0 && (
+                  <div className="rounded-md border border-amber-200 bg-amber-50 p-3 text-sm text-amber-800">
+                    <div className="mb-2 font-medium">
+                      {t("a2gControlPlane.fieldErrorsTitle")}
+                    </div>
+                    <div className="space-y-2">
+                      {fieldErrors.map((item) => (
+                        <div key={`${item.path}-${item.code}`} className="rounded border border-amber-200 bg-white p-2">
+                          <div className="font-mono text-xs text-amber-900">
+                            {item.path}
+                          </div>
+                          <div>{item.message}</div>
+                          {item.hint && (
+                            <div className="text-xs text-amber-700">{item.hint}</div>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
                 <Textarea
                   value={draftText}
                   onChange={(event) => setDraftText(event.target.value)}
@@ -568,6 +631,52 @@ export function A2GControlPlane() {
                 <div className="rounded-md border bg-muted/30 p-3 text-sm">
                   {releaseContext?.validation.message ?? "-"}
                 </div>
+                {releaseContext?.impactSummary && (
+                  <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-5">
+                    <div className="rounded-md border p-3">
+                      <div className="text-xs text-muted-foreground">
+                        {t("a2gControlPlane.impactRisk")}
+                      </div>
+                      <div className="mt-1 font-semibold">
+                        {releaseContext.impactSummary.riskLevel}
+                      </div>
+                    </div>
+                    <div className="rounded-md border p-3">
+                      <div className="text-xs text-muted-foreground">
+                        {t("a2gControlPlane.impactScenarios")}
+                      </div>
+                      <div className="mt-1 font-semibold">
+                        {releaseContext.impactSummary.changedScenarioCount}
+                      </div>
+                    </div>
+                    <div className="rounded-md border p-3">
+                      <div className="text-xs text-muted-foreground">
+                        {t("a2gControlPlane.impactProviders")}
+                      </div>
+                      <div className="mt-1 font-semibold">
+                        {releaseContext.impactSummary.changedProviderCount}
+                      </div>
+                    </div>
+                    <div className="rounded-md border p-3">
+                      <div className="text-xs text-muted-foreground">
+                        {t("a2gControlPlane.impactAuthChanges")}
+                      </div>
+                      <div className="mt-1 font-semibold">
+                        {releaseContext.impactSummary.authRelatedChangeCount}
+                      </div>
+                    </div>
+                    <div className="rounded-md border p-3">
+                      <div className="text-xs text-muted-foreground">
+                        {t("a2gControlPlane.impactChanged")}
+                      </div>
+                      <div className="mt-1 font-semibold">
+                        {releaseContext.impactSummary.hasChanges
+                          ? t("common.yes")
+                          : t("common.no")}
+                      </div>
+                    </div>
+                  </div>
+                )}
                 <div className="space-y-2">
                   <div className="font-medium">
                     {t("a2gControlPlane.snapshotListTitle")}
@@ -706,6 +815,41 @@ export function A2GControlPlane() {
                 </CardDescription>
               </CardHeader>
               <CardContent className="space-y-2">
+                <div className="grid gap-2 rounded-md border bg-muted/30 p-3 md:grid-cols-2 xl:grid-cols-[1fr_1fr_140px_140px_auto]">
+                  <Input
+                    value={authDisplayName}
+                    onChange={(event) => setAuthDisplayName(event.target.value)}
+                    placeholder={t("a2gControlPlane.authDisplayName")}
+                  />
+                  <Input
+                    value={authApiKey}
+                    onChange={(event) => setAuthApiKey(event.target.value)}
+                    placeholder={t("a2gControlPlane.authApiKey")}
+                    type="password"
+                  />
+                  <Input
+                    value={authSlot}
+                    onChange={(event) => setAuthSlot(event.target.value)}
+                    placeholder={t("a2gControlPlane.authSlot")}
+                    inputMode="numeric"
+                  />
+                  <Input
+                    value={authProvider}
+                    onChange={(event) => setAuthProvider(event.target.value)}
+                    placeholder={t("a2gControlPlane.authProvider")}
+                  />
+                  <Button onClick={handleCreateApiKeyProfile} disabled={busyAction !== null}>
+                    {t("a2gControlPlane.addApiKeyProfile")}
+                  </Button>
+                  <label className="col-span-full flex items-center gap-2 text-xs text-muted-foreground">
+                    <input
+                      checked={authTestBeforeSave}
+                      onChange={(event) => setAuthTestBeforeSave(event.target.checked)}
+                      type="checkbox"
+                    />
+                    {t("a2gControlPlane.authTestBeforeSave")}
+                  </label>
+                </div>
                 {authProfiles.slice(0, 5).map((profile) => (
                   <div
                     key={profile.id}
@@ -716,14 +860,34 @@ export function A2GControlPlane() {
                         {profile.displayName || profile.id}
                       </div>
                       <div className="truncate text-xs text-muted-foreground">
-                        {[profile.provider, profile.type, profile.secretRefId]
+                        {[
+                          profile.provider,
+                          profile.type,
+                          profile.slot ? `slot ${profile.slot}` : null,
+                          profile.maskedSecret,
+                        ]
                           .filter(Boolean)
                           .join(" · ")}
                       </div>
+                      {profile.health?.message && (
+                        <div className="mt-1 text-xs text-muted-foreground">
+                          {profile.health.message}
+                        </div>
+                      )}
                     </div>
-                    <Badge variant={profile.status === "active" ? "default" : "secondary"}>
-                      {profile.status || "draft"}
-                    </Badge>
+                    <div className="flex items-center gap-2">
+                      <Badge variant={profile.status === "active" ? "default" : "secondary"}>
+                        {profile.status || "draft"}
+                      </Badge>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        disabled={busyAction !== null}
+                        onClick={() => handleTestAuthProfile(profile.id)}
+                      >
+                        {t("a2gControlPlane.testAuthProfile")}
+                      </Button>
+                    </div>
                   </div>
                 ))}
                 {authProfiles.length === 0 && (

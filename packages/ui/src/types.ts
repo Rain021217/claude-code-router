@@ -139,6 +139,7 @@ export interface A2GGeneratePayload {
     scenarioCount: number;
     fallbackScenarioCount: number;
   };
+  fieldErrors?: A2GFieldError[];
 }
 
 export interface A2GValidatePayload extends A2GGeneratePayload {
@@ -146,11 +147,28 @@ export interface A2GValidatePayload extends A2GGeneratePayload {
   message: string;
 }
 
+export interface A2GFieldError {
+  path: string;
+  code: string;
+  message: string;
+  hint?: string | null;
+}
+
+export interface A2GImpactSummary {
+  hasChanges: boolean;
+  changedScenarioCount: number;
+  changedScenarios: string[];
+  changedProviderCount: number;
+  authRelatedChangeCount: number;
+  riskLevel: "none" | "low" | "medium" | "high";
+}
+
 export interface A2GDiffPayload {
   ok: boolean;
   draftId: string;
   draftRevision: string;
   hasUnpublishedChanges: boolean;
+  impactSummary: A2GImpactSummary;
   specDiff: {
     hasChanges: boolean;
     summary: { total: number; added: number; removed: number; changed: number };
@@ -190,6 +208,7 @@ export interface A2GReleaseContextPayload {
     ok: boolean;
     message: string;
   };
+  impactSummary: A2GImpactSummary;
   specDiff: A2GDiffPayload["specDiff"];
   generatedDiff: A2GDiffPayload["generatedDiff"];
   auditEvents: A2GAuditEvent[];
@@ -217,5 +236,16 @@ export interface A2GAuthProfile {
   status?: string;
   provider?: string;
   secretRefId?: string;
+  slot?: number | null;
+  enabled?: boolean;
+  maskedSecret?: string;
+  fingerprint?: string;
+  envVarName?: string;
+  health?: {
+    status: "unknown" | "ok" | "error";
+    message: string | null;
+    httpStatus: number | null;
+  };
+  lastHealthCheckAt?: string | null;
   updatedAt?: string;
 }

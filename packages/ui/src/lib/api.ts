@@ -114,15 +114,23 @@ class ApiClient {
       if (!response.ok) {
         // Try to get detailed error message from response body
         let errorMessage = `API request failed: ${response.status} ${response.statusText}`;
+        let errorPayload: any = null;
         try {
           const errorData = await response.json();
+          errorPayload = errorData;
           if (errorData.error || errorData.message) {
             errorMessage = errorData.message || errorData.error || errorMessage;
           }
         } catch {
           // If parsing fails, use default error message
         }
-        throw new Error(errorMessage);
+        const error = new Error(errorMessage) as Error & {
+          payload?: any;
+          status?: number;
+        };
+        error.payload = errorPayload;
+        error.status = response.status;
+        throw error;
       }
 
       if (response.status === 204) {
@@ -313,6 +321,24 @@ class ApiClient {
 
   async getA2GAuthProfiles(): Promise<{ ok: boolean; source: string; count: number; profiles: A2GAuthProfile[] }> {
     return this.get<{ ok: boolean; source: string; count: number; profiles: A2GAuthProfile[] }>('/a2g/auth-profiles');
+  }
+
+  async createA2GApiKeyProfile(payload: {
+    displayName: string;
+    apiKey: string;
+    provider?: string;
+    slot?: number;
+    enabled?: boolean;
+    test?: boolean;
+  }): Promise<{ ok: boolean; profile: A2GAuthProfile; restartRequired: boolean }> {
+    return this.post<{ ok: boolean; profile: A2GAuthProfile; restartRequired: boolean }>(
+      '/a2g/auth-profiles/api-key',
+      payload,
+    );
+  }
+
+  async testA2GAuthProfile(profileId: string): Promise<{ ok: boolean; profile: A2GAuthProfile }> {
+    return this.post<{ ok: boolean; profile: A2GAuthProfile }>(`/a2g/auth-profiles/${encodeURIComponent(profileId)}/test`, {});
   }
 
   // Save configuration (new endpoint)

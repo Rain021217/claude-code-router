@@ -107,7 +107,6 @@
     "name_required": "名称为必填项",
     "name_duplicate": "已存在同名供应商",
     "search": "搜索供应商..."
-
   },
   "router": {
     "title": "路由",
@@ -392,6 +391,22 @@
     "noAuthProfiles": "当前还没有认证资产。",
     "specDiffTitle": "Spec 差异",
     "generatedDiffTitle": "生成配置差异",
-    "diffSummary": "总计 {{total}} 项 · 修改 {{changed}} · 新增 {{added}} · 删除 {{removed}}"
+    "diffSummary": "总计 {{total}} 项 · 修改 {{changed}} · 新增 {{added}} · 删除 {{removed}}",
+    "fieldErrorsTitle": "字段级校验反馈",
+    "impactRisk": "风险等级",
+    "impactScenarios": "受影响场景数",
+    "impactProviders": "受影响 Provider 槽位数",
+    "impactAuthChanges": "认证相关变更数",
+    "impactChanged": "是否存在变更",
+    "authDisplayName": "显示名称",
+    "authApiKey": "API Key",
+    "authSlot": "槽位",
+    "authProvider": "供应商",
+    "addApiKeyProfile": "添加 API Key",
+    "authTestBeforeSave": "保存前执行连通性测试",
+    "authProfileCreated": "认证资产已创建。",
+    "authProfileCreatedRestartRequired": "认证资产已创建，运行时凭据变更需要重启后生效。",
+    "authProfileTested": "认证资产健康检查已完成。",
+    "testAuthProfile": "测试"
   }
 }

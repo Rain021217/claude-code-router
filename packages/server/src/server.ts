@@ -5,7 +5,17 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { createHash } from "node:crypto";
 import fastifyStatic from "@fastify/static";
-import { readdirSync, statSync, readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync, rmSync } from "fs";
+import {
+  chmodSync,
+  readdirSync,
+  statSync,
+  readFileSync,
+  writeFileSync,
+  existsSync,
+  mkdirSync,
+  unlinkSync,
+  rmSync,
+} from "fs";
 import { homedir } from "os";
 import {
   getPresetDir,
@@ -109,6 +119,18 @@ export const createServer = async (config: any): Promise<any> => {
     return join(authStateDir, "auth-profiles.v1.json");
   };
 
+  const getAuthSecretsDir = () => {
+    const { authStateDir } = getA2GPaths();
+    const secretsDir = join(authStateDir, "secrets");
+    ensureA2GDir(secretsDir);
+    return secretsDir;
+  };
+
+  const defaultAuthStore = () => ({
+    profiles: [] as Array<Record<string, unknown>>,
+    secretRefs: [] as Array<Record<string, unknown>>,
+  });
+
   const loadDraftSpec = (draftId = "default") => {
     const draftPath = getDraftFilePath(draftId);
     const { specPath } = getA2GPaths();
@@ -130,11 +152,288 @@ export const createServer = async (config: any): Promise<any> => {
   const loadAuthProfilesStore = () => {
     const authProfilesPath = getAuthProfilesPath();
     if (!existsSync(authProfilesPath)) {
+      return defaultAuthStore();
+    }
+    const store = readJsonFile(authProfilesPath);
+    return {
+      ...defaultAuthStore(),
+      ...(store && typeof store === "object" ? store : {}),
+      profiles: Array.isArray(store?.profiles) ? store.profiles : [],
+      secretRefs: Array.isArray(store?.secretRefs) ? store.secretRefs : [],
+    };
+  };
+
+  const saveAuthProfilesStore = (store: Record<string, unknown>) => {
+    const authProfilesPath = getAuthProfilesPath();
+    writeFileSync(authProfilesPath, `${JSON.stringify(store, null, 2)}\n`, "utf-8");
+    return store;
+  };
+
+  const createOpaqueId = (prefix: string) =>
+    `${prefix}_${createHash("sha256")
+      .update(`${Date.now()}-${Math.random()}-${prefix}`)
+      .digest("hex")
+      .slice(0, 10)}`;
+
+  const maskSecret = (secret: string) => {
+    const trimmed = secret.trim();
+    if (!trimmed) {
+      return "••••";
+    }
+    const suffix = trimmed.slice(-4);
+    return `••••${suffix}`;
+  };
+
+  const toAuthProfileView = (
+    profile: Record<string, any>,
+    secretRef?: Record<string, any>,
+  ) => ({
+    id: profile.id,
+    type: profile.type,
+    displayName: profile.displayName,
+    status: profile.status,
+    provider: profile.provider,
+    secretRefId: profile.secretRefId,
+    slot: profile.slot ?? null,
+    enabled: profile.enabled !== false,
+    maskedSecret: secretRef?.maskedValue,
+    fingerprint: secretRef?.fingerprint,
+    envVarName: secretRef?.envVarName,
+    updatedAt: profile.updatedAt,
+    lastHealthCheckAt: profile.lastHealthCheckAt,
+    health: profile.health,
+  });
+
+  const getSecretRefById = (store: Record<string, any>, secretRefId?: string) =>
+    Array.isArray(store.secretRefs)
+      ? store.secretRefs.find((item: any) => item?.id === secretRefId)
+      : undefined;
+
+  const buildAuthProfileViewList = (store: Record<string, any>) => {
+    const profiles = Array.isArray(store.profiles) ? store.profiles : [];
+    return profiles.map((profile: any) =>
+      toAuthProfileView(profile, getSecretRefById(store, profile.secretRefId)),
+    );
+  };
+
+  const normalizeProviderName = (provider?: string) =>
+    typeof provider === "string" && provider.trim() ? provider.trim() : "gemini";
+
+  const buildImpactSummary = (
+    specDiff: {
+      hasChanges: boolean;
+      changes: Array<{ path: string }>;
+    },
+    generatedDiff: {
+      hasChanges: boolean;
+      changes: Array<{ path: string }>;
+    },
+  ) => {
+    const changedScenarioNames = new Set<string>();
+    const changedProviderIndexes = new Set<string>();
+    let authRelatedChangeCount = 0;
+
+    for (const change of generatedDiff.changes) {
+      const routerMatch = /^Router\.([^.\[]+)/.exec(change.path);
+      if (routerMatch && routerMatch[1] !== "longContextThreshold") {
+        changedScenarioNames.add(routerMatch[1]);
+      }
+      const providerMatch = /^Providers\[(\d+)\]/.exec(change.path);
+      if (providerMatch) {
+        changedProviderIndexes.add(providerMatch[1]);
+      }
+    }
+
+    for (const change of specDiff.changes) {
+      if (
+        change.path.includes("api_key") ||
+        change.path.includes("auth_profile") ||
+        change.path.includes("secret")
+      ) {
+        authRelatedChangeCount += 1;
+      }
+    }
+
+    const riskLevel = authRelatedChangeCount > 0
+      ? "high"
+      : generatedDiff.changes.length > 10
+        ? "medium"
+        : generatedDiff.hasChanges || specDiff.hasChanges
+          ? "low"
+          : "none";
+
+    return {
+      hasChanges: specDiff.hasChanges || generatedDiff.hasChanges,
+      changedScenarioCount: changedScenarioNames.size,
+      changedScenarios: Array.from(changedScenarioNames).slice(0, 10),
+      changedProviderCount: changedProviderIndexes.size,
+      authRelatedChangeCount,
+      riskLevel,
+    };
+  };
+
+  const validateApiKeyOnboarding = (payload: any) => {
+    const fieldErrors: Array<Record<string, string>> = [];
+    if (!payload || typeof payload !== "object") {
+      fieldErrors.push({
+        path: "$",
+        code: "type",
+        message: "request body must be an object",
+        hint: "Provide displayName, provider, and apiKey.",
+      });
+      return fieldErrors;
+    }
+    if (
+      typeof payload.displayName !== "string" ||
+      !payload.displayName.trim()
+    ) {
+      fieldErrors.push({
+        path: "displayName",
+        code: "required",
+        message: "displayName is required",
+        hint: "Use a short readable name such as 'Gemini Main Account'.",
+      });
+    }
+    if (typeof payload.apiKey !== "string" || !payload.apiKey.trim()) {
+      fieldErrors.push({
+        path: "apiKey",
+        code: "required",
+        message: "apiKey is required",
+        hint: "Paste the upstream API key; it will be masked after save.",
+      });
+    }
+    return fieldErrors;
+  };
+
+  const buildApiKeySecretRef = (apiKey: string, slot: number, provider: string) => {
+    const normalizedProvider = normalizeProviderName(provider);
+    const secretRefId = createOpaqueId("sec");
+    const fingerprint = createHash("sha256")
+      .update(apiKey.trim())
+      .digest("hex")
+      .slice(0, 12);
+    return {
+      id: secretRefId,
+      kind: "api_key",
+      provider: normalizedProvider,
+      backend: "file",
+      path: join("secrets", `${secretRefId}.key`),
+      envVarName: `A2G_CCR_${normalizedProvider.toUpperCase()}_API_KEY_${slot}`,
+      maskedValue: maskSecret(apiKey),
+      fingerprint: `sha256:${fingerprint}`,
+      version: 1,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+  };
+
+  const writeSecretRefFile = (secretRef: Record<string, any>, secret: string) => {
+    const secretFilePath = join(getAuthSecretsDir(), `${secretRef.id}.key`);
+    writeFileSync(secretFilePath, `${secret.trim()}\n`, {
+      encoding: "utf-8",
+      mode: 0o600,
+    });
+    chmodSync(secretFilePath, 0o600);
+    return secretFilePath;
+  };
+
+  const readSecretRefValue = (secretRef: Record<string, any>) => {
+    const secretPath = join(getAuthSecretsDir(), `${secretRef.id}.key`);
+    if (!existsSync(secretPath)) {
+      throw new Error(`secret file missing for ${secretRef.id}`);
+    }
+    return readFileSync(secretPath, "utf-8").trim();
+  };
+
+  const getDefaultGeminiHealthTarget = () => {
+    const draft = loadDraftSpec("default");
+    const spec = draft.spec || {};
+    const apiBaseUrl =
+      typeof (spec as any).api_base_url === "string"
+        ? (spec as any).api_base_url
+        : "";
+    const models =
+      spec && typeof spec === "object" && (spec as any).models && typeof (spec as any).models === "object"
+        ? ((spec as any).models as Record<string, string>)
+        : {};
+    const modelName =
+      typeof models.customtools === "string" && models.customtools.trim()
+        ? models.customtools
+        : Object.values(models).find(
+            (value) => typeof value === "string" && value.trim(),
+          ) || "";
+    return {
+      apiBaseUrl,
+      modelName,
+    };
+  };
+
+  const runGeminiApiKeyHealthCheck = async (apiKey: string) => {
+    const { apiBaseUrl, modelName } = getDefaultGeminiHealthTarget();
+    if (!apiBaseUrl || !modelName) {
       return {
-        profiles: [] as Array<Record<string, unknown>>,
+        status: "unknown",
+        message: "health target unavailable",
+        httpStatus: null,
       };
     }
-    return readJsonFile(authProfilesPath);
+
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 8000);
+    try {
+      const baseUrl = apiBaseUrl.endsWith("/") ? apiBaseUrl : `${apiBaseUrl}/`;
+      const response = await fetch(
+        `${baseUrl}${encodeURIComponent(modelName)}:generateContent?key=${encodeURIComponent(apiKey.trim())}`,
+        {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({
+            contents: [
+              {
+                parts: [{ text: "ping" }],
+              },
+            ],
+            generationConfig: {
+              maxOutputTokens: 4,
+              temperature: 0,
+            },
+          }),
+          signal: controller.signal,
+        },
+      );
+      if (!response.ok) {
+        let message = response.statusText || "health check failed";
+        try {
+          const payload = await response.json();
+          message =
+            payload?.error?.message ||
+            payload?.message ||
+            message;
+        } catch {
+          // ignore
+        }
+        return {
+          status: "error",
+          message,
+          httpStatus: response.status,
+        };
+      }
+      return {
+        status: "ok",
+        message: "generateContent 200",
+        httpStatus: response.status,
+      };
+    } catch (error: any) {
+      return {
+        status: "error",
+        message: error?.name === "AbortError" ? "health check timeout" : error?.message || "network error",
+        httpStatus: null,
+      };
+    } finally {
+      clearTimeout(timeout);
+    }
   };
 
   const stableSerialize = (value: unknown): string => {
@@ -390,6 +689,7 @@ export const createServer = async (config: any): Promise<any> => {
         : {};
     const specDiff = buildJsonDiff(sourceSpec, draft.spec);
     const generatedDiff = buildJsonDiff(currentConfig, generatedConfig);
+    const impactSummary = buildImpactSummary(specDiff, generatedDiff);
 
     return {
       draftId,
@@ -412,6 +712,7 @@ export const createServer = async (config: any): Promise<any> => {
       validation,
       specDiff,
       generatedDiff,
+      impactSummary,
       auditEvents: readAuditEvents({ limit: 20 }),
       snapshots: Array.isArray(metadata.snapshots) ? metadata.snapshots.slice(0, 10) : [],
     };
@@ -445,6 +746,20 @@ export const createServer = async (config: any): Promise<any> => {
   const formatA2GScriptError = (error: any) => {
     const rawMessage =
       error?.stderr || error?.stdout || error?.message || "unknown error";
+    try {
+      const parsed = JSON.parse(rawMessage);
+      if (parsed && typeof parsed === "object" && parsed.error && parsed.message) {
+        return {
+          statusCode: 400,
+          error: parsed.error,
+          message: parsed.message,
+          details: rawMessage,
+          fieldErrors: Array.isArray(parsed.fieldErrors) ? parsed.fieldErrors : [],
+        };
+      }
+    } catch {
+      // ignore JSON parse errors and continue
+    }
     const missingFieldMatch = /KeyError: '([^']+)'/.exec(rawMessage);
     if (missingFieldMatch) {
       return {
@@ -452,6 +767,7 @@ export const createServer = async (config: any): Promise<any> => {
         error: "Invalid draft payload",
         message: `Missing required field: ${missingFieldMatch[1]}`,
         details: rawMessage,
+        fieldErrors: [],
       };
     }
     const valueErrorMatch = /ValueError\((?:[^)]*)\):?(.+)|ValueError:\s+(.+)/s.exec(
@@ -463,6 +779,7 @@ export const createServer = async (config: any): Promise<any> => {
         error: "Invalid draft payload",
         message: (valueErrorMatch[1] || valueErrorMatch[2] || rawMessage).trim(),
         details: rawMessage,
+        fieldErrors: [],
       };
     }
     return {
@@ -470,6 +787,7 @@ export const createServer = async (config: any): Promise<any> => {
       error: "A2G script execution failed",
       message: rawMessage,
       details: rawMessage,
+      fieldErrors: [],
     };
   };
 
@@ -540,13 +858,15 @@ export const createServer = async (config: any): Promise<any> => {
         message: inSyncWithRepoConfig
           ? "router config is in sync"
           : "candidate config is valid but differs from current runtime config",
+        fieldErrors: [] as Array<Record<string, string>>,
       };
     } catch (error: any) {
+      const formatted = formatA2GScriptError(error);
       return {
         ok: false,
         inSyncWithRepoConfig: false,
-        message:
-          error?.stderr || error?.stdout || error?.message || "validation failed",
+        message: formatted.message,
+        fieldErrors: formatted.fieldErrors || [],
       };
     } finally {
       rmSync(runDir, { recursive: true, force: true });
@@ -848,6 +1168,7 @@ export const createServer = async (config: any): Promise<any> => {
         error: "Failed to generate candidate config",
         message: formatted.message,
         details: formatted.details,
+        fieldErrors: formatted.fieldErrors || [],
       });
     }
   });
@@ -876,6 +1197,7 @@ export const createServer = async (config: any): Promise<any> => {
         message: validation.message,
         generatedConfig,
         summary: summarizeGeneratedConfig(generatedConfig),
+        fieldErrors: validation.fieldErrors || [],
       };
     } catch (error: any) {
       const formatted = formatA2GScriptError(error);
@@ -883,6 +1205,7 @@ export const createServer = async (config: any): Promise<any> => {
         error: "Failed to validate candidate config",
         message: formatted.message,
         details: formatted.details,
+        fieldErrors: formatted.fieldErrors || [],
       });
     }
   });
@@ -913,6 +1236,7 @@ export const createServer = async (config: any): Promise<any> => {
         hasUnpublishedChanges: releaseContext.hasUnpublishedChanges,
         specDiff: releaseContext.specDiff,
         generatedDiff: releaseContext.generatedDiff,
+        impactSummary: releaseContext.impactSummary,
       };
     } catch (error: any) {
       reply.status(500).send({
@@ -1002,6 +1326,7 @@ export const createServer = async (config: any): Promise<any> => {
         reply.status(400).send({
           error: "Publish blocked by validation",
           message: validation.message,
+          fieldErrors: validation.fieldErrors || [],
         });
         return;
       }
@@ -1072,6 +1397,7 @@ export const createServer = async (config: any): Promise<any> => {
       return {
         ok: true,
         activeVersion: releaseVersion,
+        restartRequired: true,
       };
     } catch (error: any) {
       const formatted = formatA2GScriptError(error);
@@ -1079,6 +1405,7 @@ export const createServer = async (config: any): Promise<any> => {
         error: "Failed to publish draft",
         message: formatted.message,
         details: formatted.details,
+        fieldErrors: formatted.fieldErrors || [],
       });
     }
   });
@@ -1173,7 +1500,7 @@ export const createServer = async (config: any): Promise<any> => {
   app.get("/api/a2g/auth-profiles", async (_req: any, reply: any) => {
     try {
       const store = loadAuthProfilesStore();
-      const profiles = Array.isArray(store.profiles) ? store.profiles : [];
+      const profiles = buildAuthProfileViewList(store);
       return {
         ok: true,
         source: "file_auth_profile_store_preview",
@@ -1183,6 +1510,158 @@ export const createServer = async (config: any): Promise<any> => {
     } catch (error: any) {
       reply.status(500).send({
         error: "Failed to load auth profiles",
+        message: error?.message || "unknown error",
+      });
+    }
+  });
+
+  app.post("/api/a2g/auth-profiles/api-key", async (req: any, reply: any) => {
+    try {
+      const payload = req.body;
+      const fieldErrors = validateApiKeyOnboarding(payload);
+      if (fieldErrors.length > 0) {
+        reply.status(400).send({
+          error: "Invalid auth profile payload",
+          message: fieldErrors[0]?.message || "invalid payload",
+          fieldErrors,
+        });
+        return;
+      }
+
+      const store = loadAuthProfilesStore();
+      const profiles = Array.isArray(store.profiles) ? store.profiles : [];
+      const requestedSlot = Number.isFinite(Number(payload.slot)) ? Number(payload.slot) : null;
+      const usedSlots = new Set(
+        profiles
+          .map((profile: any) => Number(profile.slot))
+          .filter((slot: number) => Number.isFinite(slot) && slot > 0),
+      );
+      const nextFreeSlot = requestedSlot && requestedSlot > 0
+        ? requestedSlot
+        : (() => {
+            let slot = 1;
+            while (usedSlots.has(slot)) {
+              slot += 1;
+            }
+            return slot;
+          })();
+
+      if (usedSlots.has(nextFreeSlot)) {
+        reply.status(400).send({
+          error: "Invalid auth profile payload",
+          message: `slot ${nextFreeSlot} is already bound to another auth profile`,
+          fieldErrors: [
+            {
+              path: "slot",
+              code: "duplicate",
+              message: `slot ${nextFreeSlot} is already in use`,
+              hint: "Choose a free pool slot or rotate the existing profile.",
+            },
+          ],
+        });
+        return;
+      }
+
+      const normalizedProvider = normalizeProviderName(payload.provider);
+      const secretRef = buildApiKeySecretRef(payload.apiKey, nextFreeSlot, normalizedProvider);
+      writeSecretRefFile(secretRef, payload.apiKey);
+
+      const now = new Date().toISOString();
+      const shouldTest = payload.test !== false;
+      const health = shouldTest
+        ? await runGeminiApiKeyHealthCheck(payload.apiKey)
+        : { status: "unknown", message: "health check skipped", httpStatus: null };
+
+      const profile = {
+        id: createOpaqueId("auth"),
+        provider: normalizedProvider,
+        type: "api_key",
+        displayName: payload.displayName.trim(),
+        status: health.status === "ok" ? "active" : "created",
+        secretRefId: secretRef.id,
+        slot: nextFreeSlot,
+        enabled: payload.enabled !== false,
+        health,
+        lastHealthCheckAt: shouldTest ? now : null,
+        createdAt: now,
+        updatedAt: now,
+      };
+
+      saveAuthProfilesStore({
+        ...store,
+        profiles: [profile, ...profiles],
+        secretRefs: [secretRef, ...(Array.isArray(store.secretRefs) ? store.secretRefs : [])],
+      });
+      appendAuditEvent({
+        type: "auth_profile_created",
+        authProfileId: profile.id,
+        provider: normalizedProvider,
+        message: `created ${profile.displayName} on slot ${nextFreeSlot}`,
+      });
+
+      return {
+        ok: true,
+        profile: toAuthProfileView(profile, secretRef),
+        restartRequired: true,
+      };
+    } catch (error: any) {
+      reply.status(500).send({
+        error: "Failed to create auth profile",
+        message: error?.message || "unknown error",
+      });
+    }
+  });
+
+  app.post("/api/a2g/auth-profiles/:id/test", async (req: any, reply: any) => {
+    try {
+      const profileId = req.params?.id;
+      const store = loadAuthProfilesStore();
+      const profiles = Array.isArray(store.profiles) ? store.profiles : [];
+      const profile = profiles.find((item: any) => item?.id === profileId);
+      if (!profile) {
+        reply.status(404).send({
+          error: "Auth profile not found",
+          message: `unknown auth profile: ${profileId}`,
+        });
+        return;
+      }
+      const secretRef = getSecretRefById(store, profile.secretRefId);
+      if (!secretRef) {
+        reply.status(404).send({
+          error: "Secret reference not found",
+          message: `missing secret reference for ${profileId}`,
+        });
+        return;
+      }
+      const apiKey = readSecretRefValue(secretRef);
+      const health = await runGeminiApiKeyHealthCheck(apiKey);
+      const now = new Date().toISOString();
+      const updatedProfile = {
+        ...profile,
+        status: health.status === "ok" ? "active" : "failed",
+        health,
+        lastHealthCheckAt: now,
+        updatedAt: now,
+      };
+      saveAuthProfilesStore({
+        ...store,
+        profiles: profiles.map((item: any) => (item?.id === profileId ? updatedProfile : item)),
+        secretRefs: store.secretRefs,
+      });
+      appendAuditEvent({
+        type: "auth_profile_tested",
+        authProfileId: profileId,
+        provider: updatedProfile.provider,
+        validationOk: health.status === "ok",
+        message: health.message,
+      });
+      return {
+        ok: true,
+        profile: toAuthProfileView(updatedProfile, secretRef),
+      };
+    } catch (error: any) {
+      reply.status(500).send({
+        error: "Failed to test auth profile",
         message: error?.message || "unknown error",
       });
     }
