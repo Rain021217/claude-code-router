@@ -126,9 +126,33 @@ export const createServer = async (config: any): Promise<any> => {
     return secretsDir;
   };
 
+  const getAuthBindingsPath = () => {
+    const { authStateDir } = getA2GPaths();
+    ensureA2GDir(authStateDir);
+    return join(authStateDir, "bindings.v1.json");
+  };
+
+  const getRuntimeBindingsEnvPath = () => {
+    const { authStateDir } = getA2GPaths();
+    ensureA2GDir(authStateDir);
+    return join(authStateDir, "runtime-bindings.env");
+  };
+
   const defaultAuthStore = () => ({
     profiles: [] as Array<Record<string, unknown>>,
     secretRefs: [] as Array<Record<string, unknown>>,
+  });
+
+  const defaultAuthBindingsState = () => ({
+    revision: null as string | null,
+    updatedAt: null as string | null,
+    bindingCount: 0,
+    missingCount: 0,
+    duplicateCount: 0,
+    bindings: [] as Array<Record<string, unknown>>,
+    missingBindings: [] as Array<Record<string, unknown>>,
+    duplicateBindings: [] as Array<Record<string, unknown>>,
+    unboundProfiles: [] as Array<Record<string, unknown>>,
   });
 
   const loadDraftSpec = (draftId = "default") => {
@@ -167,6 +191,28 @@ export const createServer = async (config: any): Promise<any> => {
     const authProfilesPath = getAuthProfilesPath();
     writeFileSync(authProfilesPath, `${JSON.stringify(store, null, 2)}\n`, "utf-8");
     return store;
+  };
+
+  const loadAuthBindingsState = () => {
+    const bindingsPath = getAuthBindingsPath();
+    if (!existsSync(bindingsPath)) {
+      return defaultAuthBindingsState();
+    }
+    const state = readJsonFile(bindingsPath);
+    return {
+      ...defaultAuthBindingsState(),
+      ...(state && typeof state === "object" ? state : {}),
+      bindings: Array.isArray(state?.bindings) ? state.bindings : [],
+      missingBindings: Array.isArray(state?.missingBindings) ? state.missingBindings : [],
+      duplicateBindings: Array.isArray(state?.duplicateBindings) ? state.duplicateBindings : [],
+      unboundProfiles: Array.isArray(state?.unboundProfiles) ? state.unboundProfiles : [],
+    };
+  };
+
+  const saveAuthBindingsState = (state: Record<string, unknown>) => {
+    const bindingsPath = getAuthBindingsPath();
+    writeFileSync(bindingsPath, `${JSON.stringify(state, null, 2)}\n`, "utf-8");
+    return state;
   };
 
   const createOpaqueId = (prefix: string) =>
@@ -209,11 +255,267 @@ export const createServer = async (config: any): Promise<any> => {
       ? store.secretRefs.find((item: any) => item?.id === secretRefId)
       : undefined;
 
+  const parseEnvFile = (content: string) => {
+    const entries: Record<string, string> = {};
+    content
+      .split("\n")
+      .map((line) => line.trim())
+      .filter((line) => line && !line.startsWith("#"))
+      .forEach((line) => {
+        const separatorIndex = line.indexOf("=");
+        if (separatorIndex <= 0) {
+          return;
+        }
+        const key = line.slice(0, separatorIndex).trim();
+        const value = line.slice(separatorIndex + 1);
+        if (key) {
+          entries[key] = value;
+        }
+      });
+    return entries;
+  };
+
+  const serializeEnvEntries = (entries: Record<string, string>) =>
+    `${Object.entries(entries)
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([key, value]) => `${key}=${value}`)
+      .join("\n")}\n`;
+
   const buildAuthProfileViewList = (store: Record<string, any>) => {
     const profiles = Array.isArray(store.profiles) ? store.profiles : [];
     return profiles.map((profile: any) =>
       toAuthProfileView(profile, getSecretRefById(store, profile.secretRefId)),
     );
+  };
+
+  const buildAuthBindingPreview = ({
+    generatedConfig,
+    store,
+  }: {
+    generatedConfig: Record<string, any>;
+    store: Record<string, any>;
+  }) => {
+    const providers = Array.isArray(generatedConfig?.Providers)
+      ? generatedConfig.Providers
+      : [];
+    const profiles = Array.isArray(store.profiles) ? store.profiles : [];
+    const enabledProfiles = profiles.filter((profile: any) => profile?.enabled !== false);
+    const profileViews = enabledProfiles.map((profile: any) =>
+      toAuthProfileView(profile, getSecretRefById(store, profile.secretRefId)),
+    );
+    const profileByEnvVar = new Map<string, Array<Record<string, any>>>();
+    for (const profile of profileViews) {
+      if (!profile.envVarName) {
+        continue;
+      }
+      const current = profileByEnvVar.get(profile.envVarName) || [];
+      current.push(profile);
+      profileByEnvVar.set(profile.envVarName, current);
+    }
+
+    const bindings: Array<Record<string, any>> = [];
+    const missingBindings: Array<Record<string, any>> = [];
+    const duplicateBindings: Array<Record<string, any>> = [];
+    const referencedEnvVars = new Set<string>();
+    const envEntries: Record<string, string> = {};
+
+    providers.forEach((provider: any, index: number) => {
+      const rawApiKey = typeof provider?.api_key === "string" ? provider.api_key : "";
+      const envVarName = rawApiKey.startsWith("$") ? rawApiKey.slice(1) : null;
+      if (!envVarName) {
+        return;
+      }
+      referencedEnvVars.add(envVarName);
+      const matchingProfiles = profileByEnvVar.get(envVarName) || [];
+      const baseRecord = {
+        providerName: provider?.name || `provider-${index + 1}`,
+        providerIndex: index,
+        envVarName,
+      };
+
+      if (matchingProfiles.length > 1) {
+        duplicateBindings.push({
+          ...baseRecord,
+          authProfileIds: matchingProfiles.map((profile) => profile.id),
+        });
+      }
+
+      if (matchingProfiles.length === 1) {
+        const profile = matchingProfiles[0];
+        const secretRef = getSecretRefById(store, profile.secretRefId);
+        if (secretRef) {
+          try {
+            envEntries[envVarName] = readSecretRefValue(secretRef);
+          } catch {
+            // ignore and leave unresolved for preview
+          }
+        }
+        bindings.push({
+          ...baseRecord,
+          source: "auth_profile",
+          status: "bound",
+          authProfileId: profile.id,
+          displayName: profile.displayName,
+          slot: profile.slot,
+          secretRefId: profile.secretRefId,
+          health: profile.health || null,
+        });
+        return;
+      }
+
+      if (matchingProfiles.length === 0 && process.env[envVarName]) {
+        envEntries[envVarName] = process.env[envVarName] as string;
+        bindings.push({
+          ...baseRecord,
+          source: "external_env",
+          status: "bound",
+          authProfileId: null,
+          displayName: "external env",
+          slot: null,
+          secretRefId: null,
+          health: null,
+        });
+        return;
+      }
+
+      bindings.push({
+        ...baseRecord,
+        source: "missing",
+        status: "missing",
+        authProfileId: null,
+        displayName: null,
+        slot: null,
+        secretRefId: null,
+        health: null,
+      });
+      missingBindings.push(baseRecord);
+    });
+
+    const unboundProfiles = profileViews
+      .filter((profile) => profile.envVarName && !referencedEnvVars.has(profile.envVarName))
+      .map((profile) => ({
+        id: profile.id,
+        displayName: profile.displayName,
+        envVarName: profile.envVarName,
+        slot: profile.slot,
+      }));
+
+    return {
+      revision: computeRevision({
+        bindings: bindings.map((binding) => ({
+          providerName: binding.providerName,
+          envVarName: binding.envVarName,
+          source: binding.source,
+          authProfileId: binding.authProfileId,
+          secretRefId: binding.secretRefId,
+        })),
+        missingBindings,
+        duplicateBindings,
+      }),
+      generatedProviderCount: providers.length,
+      bindingCount: bindings.length,
+      missingCount: missingBindings.length,
+      duplicateCount: duplicateBindings.length,
+      hasBlockingIssues:
+        missingBindings.length > 0 || duplicateBindings.length > 0,
+      bindings,
+      missingBindings,
+      duplicateBindings,
+      unboundProfiles,
+      envEntries,
+    };
+  };
+
+  const sanitizeAuthBindingPreview = (preview: Record<string, any>) => {
+    const { envEntries, ...safePreview } = preview || {};
+    return safePreview;
+  };
+
+  const captureAuthBindingArtifacts = () => {
+    const runtimeBindingsEnvPath = getRuntimeBindingsEnvPath();
+    const authBindingsPath = getAuthBindingsPath();
+    return {
+      envExists: existsSync(runtimeBindingsEnvPath),
+      envContent: existsSync(runtimeBindingsEnvPath)
+        ? readFileSync(runtimeBindingsEnvPath, "utf-8")
+        : "",
+      stateExists: existsSync(authBindingsPath),
+      stateContent: existsSync(authBindingsPath)
+        ? readFileSync(authBindingsPath, "utf-8")
+        : "",
+    };
+  };
+
+  const restoreAuthBindingArtifacts = (snapshot: {
+    envExists: boolean;
+    envContent: string;
+    stateExists: boolean;
+    stateContent: string;
+  }) => {
+    const runtimeBindingsEnvPath = getRuntimeBindingsEnvPath();
+    const authBindingsPath = getAuthBindingsPath();
+    if (snapshot.envExists) {
+      writeFileSync(runtimeBindingsEnvPath, snapshot.envContent, "utf-8");
+      Object.assign(process.env, parseEnvFile(snapshot.envContent));
+    } else if (existsSync(runtimeBindingsEnvPath)) {
+      unlinkSync(runtimeBindingsEnvPath);
+    }
+    if (snapshot.stateExists) {
+      writeFileSync(authBindingsPath, snapshot.stateContent, "utf-8");
+    } else if (existsSync(authBindingsPath)) {
+      unlinkSync(authBindingsPath);
+    }
+  };
+
+  const persistAuthBindingPreview = ({
+    preview,
+    store,
+  }: {
+    preview: Record<string, any>;
+    store: Record<string, any>;
+  }) => {
+    const now = new Date().toISOString();
+    const runtimeBindingsEnvPath = getRuntimeBindingsEnvPath();
+    const authBindingsState = {
+      revision: preview.revision,
+      updatedAt: now,
+      bindingCount: preview.bindingCount,
+      missingCount: preview.missingCount,
+      duplicateCount: preview.duplicateCount,
+      bindings: preview.bindings,
+      missingBindings: preview.missingBindings,
+      duplicateBindings: preview.duplicateBindings,
+      unboundProfiles: preview.unboundProfiles,
+    };
+    saveAuthBindingsState(authBindingsState);
+    const envEntries = { ...(preview.envEntries || {}) };
+    for (const binding of preview.bindings || []) {
+      if (
+        binding.source === "auth_profile" &&
+        binding.secretRefId &&
+        binding.envVarName &&
+        !envEntries[binding.envVarName]
+      ) {
+        const secretRef = getSecretRefById(store, binding.secretRefId);
+        if (secretRef) {
+          envEntries[binding.envVarName] = readSecretRefValue(secretRef);
+        }
+      } else if (
+        binding.source === "external_env" &&
+        binding.envVarName &&
+        !envEntries[binding.envVarName] &&
+        process.env[binding.envVarName]
+      ) {
+        envEntries[binding.envVarName] = process.env[binding.envVarName] as string;
+      }
+    }
+    writeFileSync(runtimeBindingsEnvPath, serializeEnvEntries(envEntries), {
+      encoding: "utf-8",
+      mode: 0o600,
+    });
+    chmodSync(runtimeBindingsEnvPath, 0o600);
+    Object.assign(process.env, envEntries);
+    return authBindingsState;
   };
 
   const normalizeProviderName = (provider?: string) =>
@@ -558,12 +860,14 @@ export const createServer = async (config: any): Promise<any> => {
     generatedConfig,
     validation,
     publishedBy,
+    authBindingPreview,
   }: {
     releaseVersion: string;
     spec: Record<string, unknown>;
     generatedConfig: Record<string, unknown>;
     validation: { ok: boolean; message: string };
     publishedBy: string;
+    authBindingPreview?: Record<string, unknown>;
   }) => {
     const snapshotsDir = getSnapshotDir();
     const snapshotPath = join(snapshotsDir, `${releaseVersion}.json`);
@@ -575,6 +879,7 @@ export const createServer = async (config: any): Promise<any> => {
       publishedBy,
       active: false,
       validation,
+      authBindingPreview: authBindingPreview || null,
       spec,
       generatedConfig,
     };
@@ -680,6 +985,12 @@ export const createServer = async (config: any): Promise<any> => {
     const draft = loadDraftSpec(draftId);
     const generatedConfig = await runA2GGenerate(draft.spec);
     const validation = await runA2GValidate(draft.spec, generatedConfig);
+    const authStore = loadAuthProfilesStore();
+    const authBindingPreviewRaw = buildAuthBindingPreview({
+      generatedConfig,
+      store: authStore,
+    });
+    const authBindingPreview = sanitizeAuthBindingPreview(authBindingPreviewRaw);
     const draftRevision = computeRevision(draft.spec);
     const currentConfig = await readConfigFile();
     const specPath = getA2GPaths().specPath;
@@ -710,6 +1021,7 @@ export const createServer = async (config: any): Promise<any> => {
           : null,
       hasUnpublishedChanges: specDiff.hasChanges || generatedDiff.hasChanges,
       validation,
+      authBindingPreview,
       specDiff,
       generatedDiff,
       impactSummary,
@@ -1065,6 +1377,14 @@ export const createServer = async (config: any): Promise<any> => {
             : 0,
           validation: releaseContext.validation,
         },
+        authBindingSummary: {
+          revision: releaseContext.authBindingPreview?.revision || null,
+          hasBlockingIssues:
+            releaseContext.authBindingPreview?.hasBlockingIssues || false,
+          bindingCount: releaseContext.authBindingPreview?.bindingCount || 0,
+          missingCount: releaseContext.authBindingPreview?.missingCount || 0,
+          duplicateCount: releaseContext.authBindingPreview?.duplicateCount || 0,
+        },
         authProfileSummary: {
           count: authProfiles.length,
           source: "file_auth_profile_store_preview",
@@ -1072,7 +1392,7 @@ export const createServer = async (config: any): Promise<any> => {
         notes: [
           "Control plane supports draft editing, generate/validate, publish, rollback, and audit preview.",
           "Source of truth remains config.spec.json -> generate -> config.json -> Git.",
-          "UI publish writes the generated config and records release metadata plus audit events.",
+          "UI publish writes the generated config, auth bindings, and release metadata plus audit events.",
           "Current prototype still stops short of full release governance such as approvals and rollback policies.",
         ],
       };
@@ -1237,6 +1557,7 @@ export const createServer = async (config: any): Promise<any> => {
         specDiff: releaseContext.specDiff,
         generatedDiff: releaseContext.generatedDiff,
         impactSummary: releaseContext.impactSummary,
+        authBindingPreview: releaseContext.authBindingPreview,
       };
     } catch (error: any) {
       reply.status(500).send({
@@ -1256,6 +1577,10 @@ export const createServer = async (config: any): Promise<any> => {
           : loadDraftSpec(draftId);
       const generatedConfig = await runA2GGenerate(draft.spec);
       const validation = await runA2GValidate(draft.spec, generatedConfig);
+      const authBindingPreview = sanitizeAuthBindingPreview(buildAuthBindingPreview({
+        generatedConfig,
+        store: loadAuthProfilesStore(),
+      }));
       const releaseVersion = createSnapshotVersion(computeRevision(draft.spec));
       const snapshot = saveSnapshot({
         releaseVersion,
@@ -1263,6 +1588,7 @@ export const createServer = async (config: any): Promise<any> => {
         generatedConfig,
         validation,
         publishedBy,
+        authBindingPreview: sanitizeAuthBindingPreview(authBindingPreview),
       });
 
       const metadata = loadControlPlaneMetadata();
@@ -1314,6 +1640,7 @@ export const createServer = async (config: any): Promise<any> => {
     const publishedBy = req.body?.publishedBy || "ui-publish";
     const metadataBefore = loadControlPlaneMetadata();
     const currentConfig = await readConfigFile();
+    const authArtifactsBefore = captureAuthBindingArtifacts();
     const previousActiveVersion = metadataBefore.activeVersion || null;
     try {
       const draft =
@@ -1322,11 +1649,24 @@ export const createServer = async (config: any): Promise<any> => {
           : loadDraftSpec(draftId);
       const generatedConfig = await runA2GGenerate(draft.spec);
       const validation = await runA2GValidate(draft.spec, generatedConfig);
+      const authStore = loadAuthProfilesStore();
+      const authBindingPreview = buildAuthBindingPreview({
+        generatedConfig,
+        store: authStore,
+      });
       if (!validation.ok) {
         reply.status(400).send({
           error: "Publish blocked by validation",
           message: validation.message,
           fieldErrors: validation.fieldErrors || [],
+        });
+        return;
+      }
+      if (authBindingPreview.hasBlockingIssues) {
+        reply.status(400).send({
+          error: "Publish blocked by auth binding preview",
+          message: "Resolve missing or duplicate auth bindings before publish",
+          authBindingPreview,
         });
         return;
       }
@@ -1338,11 +1678,16 @@ export const createServer = async (config: any): Promise<any> => {
         generatedConfig,
         validation,
         publishedBy,
+        authBindingPreview,
       });
 
       await backupConfigFile();
       try {
         await writeConfigFile(generatedConfig);
+        const authBindingState = persistAuthBindingPreview({
+          preview: authBindingPreview,
+          store: authStore,
+        });
         const metadata = loadControlPlaneMetadata();
         updateMetadataSnapshots(metadata, (item) => ({
           ...item,
@@ -1387,16 +1732,19 @@ export const createServer = async (config: any): Promise<any> => {
           targetVersion: releaseVersion,
           draftRevision: snapshot.draftRevision,
           publishedBy,
+          authBindingsRevision: authBindingState.revision,
         });
       } catch (error) {
         await writeConfigFile(currentConfig);
         saveControlPlaneMetadata(metadataBefore);
+        restoreAuthBindingArtifacts(authArtifactsBefore);
         throw error;
       }
 
       return {
         ok: true,
         activeVersion: releaseVersion,
+        authBindingsRevision: authBindingPreview.revision,
         restartRequired: true,
       };
     } catch (error: any) {
@@ -1423,12 +1771,23 @@ export const createServer = async (config: any): Promise<any> => {
 
     const metadataBefore = loadControlPlaneMetadata();
     const currentConfig = await readConfigFile();
+    const authArtifactsBefore = captureAuthBindingArtifacts();
     const previousActiveVersion = metadataBefore.activeVersion || null;
     try {
       const snapshot = loadSnapshot(releaseVersion);
       await backupConfigFile();
       try {
         await writeConfigFile(snapshot.generatedConfig);
+        const authStore = loadAuthProfilesStore();
+        const authBindingsState = persistAuthBindingPreview({
+          preview:
+            snapshot.authBindingPreview ||
+            buildAuthBindingPreview({
+              generatedConfig: snapshot.generatedConfig,
+              store: authStore,
+            }),
+          store: authStore,
+        });
         const metadata = loadControlPlaneMetadata();
         updateMetadataSnapshots(metadata, (item) => ({
           ...item,
@@ -1448,16 +1807,19 @@ export const createServer = async (config: any): Promise<any> => {
           sourceVersion: previousActiveVersion,
           targetVersion: releaseVersion,
           publishedBy,
+          authBindingsRevision: authBindingsState.revision,
         });
       } catch (error) {
         await writeConfigFile(currentConfig);
         saveControlPlaneMetadata(metadataBefore);
+        restoreAuthBindingArtifacts(authArtifactsBefore);
         throw error;
       }
 
       return {
         ok: true,
         activeVersion: releaseVersion,
+        restartRequired: true,
       };
     } catch (error: any) {
       reply.status(500).send({
@@ -1493,6 +1855,31 @@ export const createServer = async (config: any): Promise<any> => {
       reply.status(500).send({
         error: "Failed to load audit events",
         message: error?.message || "unknown error",
+      });
+    }
+  });
+
+  app.get("/api/a2g/auth-bindings/preview", async (req: any, reply: any) => {
+    try {
+      const draftId = ((req.query as any)?.draftId as string) || "default";
+      const draft = loadDraftSpec(draftId);
+      const generatedConfig = await runA2GGenerate(draft.spec);
+      const preview = sanitizeAuthBindingPreview(buildAuthBindingPreview({
+        generatedConfig,
+        store: loadAuthProfilesStore(),
+      }));
+      return {
+        ok: true,
+        draftId,
+        ...preview,
+      };
+    } catch (error: any) {
+      const formatted = formatA2GScriptError(error);
+      reply.status(formatted.statusCode).send({
+        error: "Failed to build auth binding preview",
+        message: formatted.message,
+        details: formatted.details,
+        fieldErrors: formatted.fieldErrors || [],
       });
     }
   });
@@ -1662,6 +2049,94 @@ export const createServer = async (config: any): Promise<any> => {
     } catch (error: any) {
       reply.status(500).send({
         error: "Failed to test auth profile",
+        message: error?.message || "unknown error",
+      });
+    }
+  });
+
+  app.post("/api/a2g/auth-profiles/:id/rotate", async (req: any, reply: any) => {
+    try {
+      const profileId = req.params?.id;
+      const apiKey =
+        typeof req.body?.apiKey === "string" ? req.body.apiKey.trim() : "";
+      if (!apiKey) {
+        reply.status(400).send({
+          error: "Invalid auth rotation payload",
+          message: "apiKey is required",
+          fieldErrors: [
+            {
+              path: "apiKey",
+              code: "required",
+              message: "apiKey is required",
+              hint: "Paste the replacement upstream API key.",
+            },
+          ],
+        });
+        return;
+      }
+      const store = loadAuthProfilesStore();
+      const profiles = Array.isArray(store.profiles) ? store.profiles : [];
+      const secretRefs = Array.isArray(store.secretRefs) ? store.secretRefs : [];
+      const profile = profiles.find((item: any) => item?.id === profileId);
+      if (!profile) {
+        reply.status(404).send({
+          error: "Auth profile not found",
+          message: `unknown auth profile: ${profileId}`,
+        });
+        return;
+      }
+      const secretRef = getSecretRefById(store, profile.secretRefId);
+      if (!secretRef) {
+        reply.status(404).send({
+          error: "Secret reference not found",
+          message: `missing secret reference for ${profileId}`,
+        });
+        return;
+      }
+
+      writeSecretRefFile(secretRef, apiKey);
+      const now = new Date().toISOString();
+      const shouldTest = req.body?.test !== false;
+      const health = shouldTest
+        ? await runGeminiApiKeyHealthCheck(apiKey)
+        : { status: "unknown", message: "health check skipped", httpStatus: null };
+      const updatedSecretRef = {
+        ...secretRef,
+        maskedValue: maskSecret(apiKey),
+        fingerprint: `sha256:${createHash("sha256").update(apiKey).digest("hex").slice(0, 12)}`,
+        version: Number(secretRef.version || 0) + 1,
+        updatedAt: now,
+      };
+      const updatedProfile = {
+        ...profile,
+        status: health.status === "ok" ? "active" : "failed",
+        health,
+        lastHealthCheckAt: shouldTest ? now : profile.lastHealthCheckAt || null,
+        updatedAt: now,
+      };
+
+      saveAuthProfilesStore({
+        ...store,
+        profiles: profiles.map((item: any) => (item?.id === profileId ? updatedProfile : item)),
+        secretRefs: secretRefs.map((item: any) =>
+          item?.id === updatedSecretRef.id ? updatedSecretRef : item
+        ),
+      });
+      appendAuditEvent({
+        type: "auth_profile_rotated",
+        authProfileId: profileId,
+        provider: updatedProfile.provider,
+        validationOk: health.status === "ok",
+        message: shouldTest ? health.message : "rotation saved without health test",
+      });
+      return {
+        ok: true,
+        profile: toAuthProfileView(updatedProfile, updatedSecretRef),
+        restartRequired: true,
+      };
+    } catch (error: any) {
+      reply.status(500).send({
+        error: "Failed to rotate auth profile",
         message: error?.message || "unknown error",
       });
     }

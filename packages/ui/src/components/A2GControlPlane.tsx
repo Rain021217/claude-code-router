@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useNavigate } from "react-router-dom";
 import { ArrowLeft, RefreshCw } from "lucide-react";
@@ -10,6 +10,7 @@ import type {
   A2GGeneratePayload,
   A2GReleaseContextPayload,
   A2GAuthProfile,
+  A2GAuthBindingPreview,
   A2GValidatePayload,
 } from "@/types";
 import { Button } from "@/components/ui/button";
@@ -35,6 +36,8 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 const pathBadgeVariant = (ok: boolean): "default" | "destructive" =>
   ok ? "default" : "destructive";
 
+const DRAFT_LOCAL_STORAGE_KEY = "a2g-control-plane-draft-default";
+
 export function A2GControlPlane() {
   const { t } = useTranslation();
   const navigate = useNavigate();
@@ -52,6 +55,8 @@ export function A2GControlPlane() {
   const [releaseContext, setReleaseContext] =
     useState<A2GReleaseContextPayload | null>(null);
   const [diffPreview, setDiffPreview] = useState<A2GDiffPayload | null>(null);
+  const [bindingPreview, setBindingPreview] =
+    useState<A2GAuthBindingPreview | null>(null);
   const [auditEvents, setAuditEvents] = useState<
     A2GReleaseContextPayload["auditEvents"]
   >([]);
@@ -62,12 +67,21 @@ export function A2GControlPlane() {
   const [authSlot, setAuthSlot] = useState("");
   const [authProvider, setAuthProvider] = useState("gemini");
   const [authTestBeforeSave, setAuthTestBeforeSave] = useState(true);
+  const [rotationProfileId, setRotationProfileId] = useState("");
+  const [rotationApiKey, setRotationApiKey] = useState("");
+  const [rotationTestBeforeSave, setRotationTestBeforeSave] = useState(true);
   const [auditTypeFilter, setAuditTypeFilter] = useState("all");
   const [auditReleaseFilter, setAuditReleaseFilter] = useState("");
   const [auditSinceFilter, setAuditSinceFilter] = useState("");
   const [auditUntilFilter, setAuditUntilFilter] = useState("");
   const [actionError, setActionError] = useState<string | null>(null);
   const [busyAction, setBusyAction] = useState<string | null>(null);
+  const [autosaveStatus, setAutosaveStatus] = useState<"idle" | "saving" | "saved" | "invalid" | "error">("idle");
+  const [autosaveMessage, setAutosaveMessage] = useState<string | null>(null);
+  const [recoverableDraftText, setRecoverableDraftText] = useState<string | null>(null);
+  const [recoverableDraftAt, setRecoverableDraftAt] = useState<string | null>(null);
+  const hydrationCompleteRef = useRef(false);
+  const lastServerDraftTextRef = useRef("");
 
   const toIsoOrUndefined = (value: string) =>
     value.trim() ? new Date(value).toISOString() : undefined;
@@ -95,11 +109,41 @@ export function A2GControlPlane() {
         api.getA2GAuthProfiles(),
       ]);
       setData(payload);
-      setDraftText(JSON.stringify(draft.spec, null, 2));
+      const serverDraftText = JSON.stringify(draft.spec, null, 2);
+      const localDraft = localStorage.getItem(DRAFT_LOCAL_STORAGE_KEY);
+      let recoveredLocalDraftText: string | null = null;
+      let recoveredLocalDraftAt: string | null = null;
+      if (localDraft) {
+        try {
+          const parsed = JSON.parse(localDraft) as {
+            draftText?: string;
+            updatedAt?: string;
+          };
+          if (
+            typeof parsed.draftText === "string" &&
+            parsed.draftText.trim() &&
+            parsed.draftText !== serverDraftText
+          ) {
+            recoveredLocalDraftText = parsed.draftText;
+            recoveredLocalDraftAt =
+              typeof parsed.updatedAt === "string" ? parsed.updatedAt : null;
+          }
+        } catch {
+          localStorage.removeItem(DRAFT_LOCAL_STORAGE_KEY);
+        }
+      }
+      setRecoverableDraftText(recoveredLocalDraftText);
+      setRecoverableDraftAt(recoveredLocalDraftAt);
+      setDraftText(serverDraftText);
       setDraftSource(draft.source);
       setReleaseContext(release);
+      setBindingPreview(release.authBindingPreview ?? null);
       setAuditEvents(release.auditEvents ?? []);
       setAuthProfiles(authProfilesPayload.profiles ?? []);
+      lastServerDraftTextRef.current = serverDraftText;
+      hydrationCompleteRef.current = true;
+      setAutosaveStatus("idle");
+      setAutosaveMessage(null);
     } catch (err) {
       setError((err as Error).message);
     } finally {
@@ -192,6 +236,7 @@ export function A2GControlPlane() {
       ]);
       setData(payload);
       setReleaseContext(release);
+      setBindingPreview(release.authBindingPreview ?? null);
       setAuditEvents(audit.events);
       setDraftMessage(t("a2gControlPlane.publishSuccess"));
     });
@@ -206,6 +251,7 @@ export function A2GControlPlane() {
       ]);
       setData(payload);
       setReleaseContext(release);
+      setBindingPreview(release.authBindingPreview ?? null);
       setAuditEvents(audit.events);
       setDraftMessage(
         t("a2gControlPlane.rollbackSuccess", { releaseVersion }),
@@ -240,8 +286,13 @@ export function A2GControlPlane() {
           ? t("a2gControlPlane.authProfileCreatedRestartRequired")
           : t("a2gControlPlane.authProfileCreated"),
       );
-      const payload = await api.getA2GControlPlane();
+      const [payload, release] = await Promise.all([
+        api.getA2GControlPlane(),
+        api.getA2GReleaseContext(),
+      ]);
       setData(payload);
+      setReleaseContext(release);
+      setBindingPreview(release.authBindingPreview ?? null);
     });
 
   const handleTestAuthProfile = (profileId: string) =>
@@ -253,6 +304,35 @@ export function A2GControlPlane() {
         ),
       );
       setDraftMessage(t("a2gControlPlane.authProfileTested"));
+    });
+
+  const handleRotateAuthProfile = () =>
+    runAction("auth-rotate", async () => {
+      if (!rotationProfileId) {
+        throw new Error(t("a2gControlPlane.authRotationProfileRequired"));
+      }
+      const response = await api.rotateA2GAuthProfile(rotationProfileId, {
+        apiKey: rotationApiKey,
+        test: rotationTestBeforeSave,
+      });
+      setAuthProfiles((current) =>
+        current.map((profile) =>
+          profile.id === rotationProfileId ? response.profile : profile,
+        ),
+      );
+      setRotationApiKey("");
+      setDraftMessage(
+        response.restartRequired
+          ? t("a2gControlPlane.authProfileRotatedRestartRequired")
+          : t("a2gControlPlane.authProfileRotated"),
+      );
+      const [payload, release] = await Promise.all([
+        api.getA2GControlPlane(),
+        api.getA2GReleaseContext(),
+      ]);
+      setData(payload);
+      setReleaseContext(release);
+      setBindingPreview(release.authBindingPreview ?? null);
     });
 
   const loadAudit = async () => {
@@ -281,6 +361,66 @@ export function A2GControlPlane() {
       setAuditEvents(audit.events);
       setDraftMessage(t("a2gControlPlane.auditFiltersReset"));
     });
+
+  const handleRecoverLocalDraft = () => {
+    if (!recoverableDraftText) {
+      return;
+    }
+    setDraftText(recoverableDraftText);
+    setRecoverableDraftText(null);
+    setRecoverableDraftAt(null);
+    setDraftMessage(t("a2gControlPlane.localDraftRecovered"));
+  };
+
+  const handleDiscardLocalDraft = () => {
+    localStorage.removeItem(DRAFT_LOCAL_STORAGE_KEY);
+    setRecoverableDraftText(null);
+    setRecoverableDraftAt(null);
+    setDraftMessage(t("a2gControlPlane.localDraftDiscarded"));
+  };
+
+  useEffect(() => {
+    if (!hydrationCompleteRef.current) {
+      return;
+    }
+    const updatedAt = new Date().toISOString();
+    localStorage.setItem(
+      DRAFT_LOCAL_STORAGE_KEY,
+      JSON.stringify({ draftText, updatedAt }),
+    );
+  }, [draftText]);
+
+  useEffect(() => {
+    if (!hydrationCompleteRef.current) {
+      return;
+    }
+    if (draftText === lastServerDraftTextRef.current) {
+      setAutosaveStatus("idle");
+      setAutosaveMessage(null);
+      return;
+    }
+    const timer = window.setTimeout(async () => {
+      try {
+        const spec = JSON.parse(draftText) as Record<string, unknown>;
+        setAutosaveStatus("saving");
+        setAutosaveMessage(t("a2gControlPlane.autosaveSaving"));
+        await api.saveA2GDraft(spec);
+        lastServerDraftTextRef.current = draftText;
+        setDraftSource("draft");
+        setAutosaveStatus("saved");
+        setAutosaveMessage(t("a2gControlPlane.autosaveSaved"));
+      } catch (error) {
+        if (error instanceof SyntaxError) {
+          setAutosaveStatus("invalid");
+          setAutosaveMessage(t("a2gControlPlane.autosaveWaitingForValidJson"));
+          return;
+        }
+        setAutosaveStatus("error");
+        setAutosaveMessage((error as Error).message);
+      }
+    }, 1200);
+    return () => window.clearTimeout(timer);
+  }, [draftText, t]);
 
   return (
     <div className="h-screen bg-gray-50 font-sans">
@@ -493,9 +633,44 @@ export function A2GControlPlane() {
                     {draftMessage}
                   </div>
                 )}
+                {recoverableDraftText && (
+                  <div className="rounded-md border border-blue-200 bg-blue-50 p-3 text-sm text-blue-800">
+                    <div className="font-medium">
+                      {t("a2gControlPlane.localDraftFound")}
+                    </div>
+                    <div className="mt-1 text-xs text-blue-700">
+                      {recoverableDraftAt || t("a2gControlPlane.localDraftUnknownTime")}
+                    </div>
+                    <div className="mt-3 flex flex-wrap gap-2">
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={handleRecoverLocalDraft}
+                        disabled={busyAction !== null}
+                      >
+                        {t("a2gControlPlane.recoverLocalDraft")}
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        onClick={handleDiscardLocalDraft}
+                        disabled={busyAction !== null}
+                      >
+                        {t("a2gControlPlane.discardLocalDraft")}
+                      </Button>
+                    </div>
+                  </div>
+                )}
                 {actionError && (
                   <div className="rounded-md border border-red-200 bg-red-50 p-3 text-sm text-red-700">
                     {actionError}
+                  </div>
+                )}
+                {autosaveMessage && (
+                  <div className="rounded-md border border-slate-200 bg-slate-50 p-3 text-xs text-slate-700">
+                    {autosaveStatus === "saving"
+                      ? t("a2gControlPlane.autosaveSaving")
+                      : autosaveMessage}
                   </div>
                 )}
                 {fieldErrors.length > 0 && (
@@ -677,6 +852,96 @@ export function A2GControlPlane() {
                     </div>
                   </div>
                 )}
+                {bindingPreview && (
+                  <div className="space-y-2 rounded-md border bg-muted/20 p-3">
+                    <div className="flex items-center justify-between gap-2">
+                      <div className="font-medium">
+                        {t("a2gControlPlane.authBindingPreviewTitle")}
+                      </div>
+                      <Badge
+                        variant={
+                          bindingPreview.hasBlockingIssues
+                            ? "destructive"
+                            : "default"
+                        }
+                      >
+                        {bindingPreview.hasBlockingIssues
+                          ? t("a2gControlPlane.authBindingBlocked")
+                          : t("a2gControlPlane.authBindingReady")}
+                      </Badge>
+                    </div>
+                    <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+                      <div className="rounded-md border p-3">
+                        <div className="text-xs text-muted-foreground">
+                          {t("a2gControlPlane.authBindingCount")}
+                        </div>
+                        <div className="mt-1 font-semibold">
+                          {bindingPreview.bindingCount}
+                        </div>
+                      </div>
+                      <div className="rounded-md border p-3">
+                        <div className="text-xs text-muted-foreground">
+                          {t("a2gControlPlane.authBindingMissing")}
+                        </div>
+                        <div className="mt-1 font-semibold">
+                          {bindingPreview.missingCount}
+                        </div>
+                      </div>
+                      <div className="rounded-md border p-3">
+                        <div className="text-xs text-muted-foreground">
+                          {t("a2gControlPlane.authBindingDuplicate")}
+                        </div>
+                        <div className="mt-1 font-semibold">
+                          {bindingPreview.duplicateCount}
+                        </div>
+                      </div>
+                      <div className="rounded-md border p-3">
+                        <div className="text-xs text-muted-foreground">
+                          {t("a2gControlPlane.authBindingRevision")}
+                        </div>
+                        <div className="mt-1 font-semibold">
+                          {bindingPreview.revision}
+                        </div>
+                      </div>
+                    </div>
+                    <div className="space-y-2">
+                      {bindingPreview.bindings.slice(0, 8).map((binding) => (
+                        <div
+                          key={`${binding.providerName}-${binding.envVarName}`}
+                          className="flex items-center justify-between gap-3 rounded-md border p-3 text-sm"
+                        >
+                          <div className="min-w-0">
+                            <div className="font-medium">
+                              {binding.providerName}
+                            </div>
+                            <div className="truncate text-xs text-muted-foreground">
+                              {[
+                                binding.envVarName,
+                                binding.displayName,
+                                binding.slot ? `slot ${binding.slot}` : null,
+                              ]
+                                .filter(Boolean)
+                                .join(" <- ")}
+                            </div>
+                          </div>
+                          <div className="flex items-center gap-2">
+                            <Badge
+                              variant={
+                                binding.status === "missing"
+                                  ? "destructive"
+                                  : binding.source === "external_env"
+                                    ? "secondary"
+                                    : "default"
+                              }
+                            >
+                              {binding.source}
+                            </Badge>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
                 <div className="space-y-2">
                   <div className="font-medium">
                     {t("a2gControlPlane.snapshotListTitle")}
@@ -850,6 +1115,37 @@ export function A2GControlPlane() {
                     {t("a2gControlPlane.authTestBeforeSave")}
                   </label>
                 </div>
+                <div className="grid gap-2 rounded-md border bg-muted/20 p-3 md:grid-cols-2 xl:grid-cols-[220px_1fr_auto]">
+                  <Select value={rotationProfileId} onValueChange={setRotationProfileId}>
+                    <SelectTrigger>
+                      <SelectValue placeholder={t("a2gControlPlane.authRotationSelect")} />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {authProfiles.map((profile) => (
+                        <SelectItem key={profile.id} value={profile.id}>
+                          {profile.displayName || profile.id}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                  <Input
+                    value={rotationApiKey}
+                    onChange={(event) => setRotationApiKey(event.target.value)}
+                    placeholder={t("a2gControlPlane.authRotationApiKey")}
+                    type="password"
+                  />
+                  <Button onClick={handleRotateAuthProfile} disabled={busyAction !== null}>
+                    {t("a2gControlPlane.rotateAuthProfile")}
+                  </Button>
+                  <label className="col-span-full flex items-center gap-2 text-xs text-muted-foreground">
+                    <input
+                      checked={rotationTestBeforeSave}
+                      onChange={(event) => setRotationTestBeforeSave(event.target.checked)}
+                      type="checkbox"
+                    />
+                    {t("a2gControlPlane.authRotationTestBeforeSave")}
+                  </label>
+                </div>
                 {authProfiles.slice(0, 5).map((profile) => (
                   <div
                     key={profile.id}
@@ -886,6 +1182,14 @@ export function A2GControlPlane() {
                         onClick={() => handleTestAuthProfile(profile.id)}
                       >
                         {t("a2gControlPlane.testAuthProfile")}
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        disabled={busyAction !== null}
+                        onClick={() => setRotationProfileId(profile.id)}
+                      >
+                        {t("a2gControlPlane.prepareRotateAuthProfile")}
                       </Button>
                     </div>
                   </div>

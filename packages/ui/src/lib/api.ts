@@ -1,6 +1,7 @@
 import type {
   A2GControlPlaneData,
   A2GAuditEvent,
+  A2GAuthBindingPreviewPayload,
   A2GAuthProfile,
   A2GDiffPayload,
   A2GDraftPayload,
@@ -281,8 +282,8 @@ class ApiClient {
     spec: Record<string, unknown>,
     draftId: string = 'default',
     publishedBy: string = 'ui-publish',
-  ): Promise<{ ok: boolean; activeVersion: string }> {
-    return this.post<{ ok: boolean; activeVersion: string }>('/a2g/publish', {
+  ): Promise<{ ok: boolean; activeVersion: string; authBindingsRevision?: string; restartRequired?: boolean }> {
+    return this.post<{ ok: boolean; activeVersion: string; authBindingsRevision?: string; restartRequired?: boolean }>('/a2g/publish', {
       draftId,
       publishedBy,
       spec,
@@ -292,8 +293,8 @@ class ApiClient {
   async rollbackA2GSnapshot(
     releaseVersion: string,
     publishedBy: string = 'ui-rollback',
-  ): Promise<{ ok: boolean; activeVersion: string }> {
-    return this.post<{ ok: boolean; activeVersion: string }>('/a2g/rollback', {
+  ): Promise<{ ok: boolean; activeVersion: string; restartRequired?: boolean }> {
+    return this.post<{ ok: boolean; activeVersion: string; restartRequired?: boolean }>('/a2g/rollback', {
       releaseVersion,
       publishedBy,
     });
@@ -323,6 +324,10 @@ class ApiClient {
     return this.get<{ ok: boolean; source: string; count: number; profiles: A2GAuthProfile[] }>('/a2g/auth-profiles');
   }
 
+  async getA2GAuthBindingsPreview(draftId: string = 'default'): Promise<A2GAuthBindingPreviewPayload> {
+    return this.get<A2GAuthBindingPreviewPayload>(`/a2g/auth-bindings/preview?draftId=${encodeURIComponent(draftId)}`);
+  }
+
   async createA2GApiKeyProfile(payload: {
     displayName: string;
     apiKey: string;
@@ -339,6 +344,16 @@ class ApiClient {
 
   async testA2GAuthProfile(profileId: string): Promise<{ ok: boolean; profile: A2GAuthProfile }> {
     return this.post<{ ok: boolean; profile: A2GAuthProfile }>(`/a2g/auth-profiles/${encodeURIComponent(profileId)}/test`, {});
+  }
+
+  async rotateA2GAuthProfile(
+    profileId: string,
+    payload: { apiKey: string; test?: boolean },
+  ): Promise<{ ok: boolean; profile: A2GAuthProfile; restartRequired: boolean }> {
+    return this.post<{ ok: boolean; profile: A2GAuthProfile; restartRequired: boolean }>(
+      `/a2g/auth-profiles/${encodeURIComponent(profileId)}/rotate`,
+      payload,
+    );
   }
 
   // Save configuration (new endpoint)

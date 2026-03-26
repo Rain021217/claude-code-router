@@ -37,6 +37,36 @@ const ensureDir = async (dir_path: string) => {
   }
 };
 
+const loadRuntimeBindingsEnv = async () => {
+  const authStateDir =
+    process.env.A2G_AUTH_STATE_DIR || path.join(HOME_DIR, "state", "a2g-auth");
+  const runtimeBindingsEnvPath = path.join(authStateDir, "runtime-bindings.env");
+  try {
+    const content = await fs.readFile(runtimeBindingsEnvPath, "utf-8");
+    const bindings = content
+      .split("\n")
+      .map((line) => line.trim())
+      .filter((line) => line && !line.startsWith("#"))
+      .reduce<Record<string, string>>((acc, line) => {
+        const separatorIndex = line.indexOf("=");
+        if (separatorIndex <= 0) {
+          return acc;
+        }
+        const key = line.slice(0, separatorIndex).trim();
+        const value = line.slice(separatorIndex + 1);
+        if (key) {
+          acc[key] = value;
+        }
+        return acc;
+      }, {});
+    Object.assign(process.env, bindings);
+  } catch (error: any) {
+    if (error?.code !== "ENOENT") {
+      console.warn("Failed to load runtime auth bindings:", error?.message || error);
+    }
+  }
+};
+
 export const initDir = async () => {
   await ensureDir(HOME_DIR);
   await ensureDir(PLUGINS_DIR);
@@ -167,6 +197,7 @@ export const writeConfigFile = async (config: any) => {
 };
 
 export const initConfig = async () => {
+  await loadRuntimeBindingsEnv();
   const config = await readConfigFile();
   Object.assign(process.env, config);
   return config;

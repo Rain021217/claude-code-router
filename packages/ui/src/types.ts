@@ -117,6 +117,13 @@ export interface A2GControlPlaneData {
       message: string;
     };
   };
+  authBindingSummary?: {
+    revision: string | null;
+    hasBlockingIssues: boolean;
+    bindingCount: number;
+    missingCount: number;
+    duplicateCount: number;
+  };
   authProfileSummary?: {
     count: number;
     source: string;
@@ -163,12 +170,43 @@ export interface A2GImpactSummary {
   riskLevel: "none" | "low" | "medium" | "high";
 }
 
+export interface A2GAuthBindingEntry {
+  providerName: string;
+  providerIndex: number;
+  envVarName: string;
+  source: "auth_profile" | "external_env" | "missing";
+  status: "bound" | "missing";
+  authProfileId: string | null;
+  displayName: string | null;
+  slot: number | null;
+  secretRefId: string | null;
+  health?: {
+    status: "unknown" | "ok" | "error";
+    message: string | null;
+    httpStatus: number | null;
+  } | null;
+}
+
+export interface A2GAuthBindingPreview {
+  revision: string;
+  generatedProviderCount: number;
+  bindingCount: number;
+  missingCount: number;
+  duplicateCount: number;
+  hasBlockingIssues: boolean;
+  bindings: A2GAuthBindingEntry[];
+  missingBindings: Array<Record<string, unknown>>;
+  duplicateBindings: Array<Record<string, unknown>>;
+  unboundProfiles: Array<Record<string, unknown>>;
+}
+
 export interface A2GDiffPayload {
   ok: boolean;
   draftId: string;
   draftRevision: string;
   hasUnpublishedChanges: boolean;
   impactSummary: A2GImpactSummary;
+  authBindingPreview: A2GAuthBindingPreview;
   specDiff: {
     hasChanges: boolean;
     summary: { total: number; added: number; removed: number; changed: number };
@@ -209,6 +247,7 @@ export interface A2GReleaseContextPayload {
     message: string;
   };
   impactSummary: A2GImpactSummary;
+  authBindingPreview: A2GAuthBindingPreview;
   specDiff: A2GDiffPayload["specDiff"];
   generatedDiff: A2GDiffPayload["generatedDiff"];
   auditEvents: A2GAuditEvent[];
@@ -248,4 +287,9 @@ export interface A2GAuthProfile {
   };
   lastHealthCheckAt?: string | null;
   updatedAt?: string;
+}
+
+export interface A2GAuthBindingPreviewPayload extends A2GAuthBindingPreview {
+  ok: boolean;
+  draftId: string;
 }
